@@ -34,7 +34,7 @@ jsonschema-specifications==2025.4.1
 markdown-it-py==3.0.0
 mcp==1.12.2
 mdurl==0.1.2
-microsoft-fabric-rti-mcp==0.0.2
+# microsoft-fabric-rti-mcp==0.0.2
 msal==1.33.0
 msal-extensions==1.3.1
 openapi-pydantic==0.5.1
