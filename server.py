@@ -188,13 +188,6 @@ def kusto_sample_function_data(
         f"{function_call_with_params} | sample {sample_size}", database, readonly=True
     )
 
-@mcp.tool(description="Ingest inline CSV data into a table")
-def kusto_ingest_inline_into_table(
-    table_name: str, data_comma_separator: str, database: str = DB
-) -> List[Dict[str, Any]]:
-    cmd = f".ingest inline into table {table_name} <| {data_comma_separator}"
-    return execute_kusto(cmd, database, readonly=False)
-
 @mcp.tool(description="Get cluster information")
 def kusto_get_clusters() -> List[tuple]:
     return [(CLUSTER_URI, "Primary cluster")]
