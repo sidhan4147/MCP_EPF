@@ -141,7 +141,7 @@ def kusto_query(query: str, database: str = DB) -> List[Dict[str, Any]]:
 
 @mcp.tool(description="Execute a Kusto management command")
 def kusto_command(command: str, database: str = DB) -> List[Dict[str, Any]]:
-    return execute_kusto(command, database, readonly=False)
+    return execute_kusto(command, database, readonly=True)
 
 @mcp.tool(description="List all available databases in the connected Kusto cluster. Useful to discover valid targets for queries.")
 def kusto_list_databases() -> List[Dict[str, Any]]:
