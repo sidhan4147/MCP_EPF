@@ -1,13 +1,13 @@
 import os
 import uuid
 import datetime
+from datetime import timezone, timedelta
 import logging
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
-import requests
-
+import pyodbc 
 from azure.kusto.data import (
     KustoClient,
     KustoConnectionStringBuilder,
@@ -17,20 +17,24 @@ from azure.kusto.data.response import KustoResponseDataSet
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
-
+from rapidfuzz import fuzz
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import re
+from pathlib import Path
 
-# Load environment variables
 load_dotenv()
-
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-server")
 
-# Kusto (Fabric Eventhouse) connection
+def _dbg(msg: str):
+    """Mirror logs to stdout for easy n8n/Azure log viewing."""
+    print(msg, flush=True)
+    logger.info(msg)
+
+
 KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
     os.environ["KUSTO_SERVICE_URI"],
     os.environ["AZURE_CLIENT_ID"],
@@ -39,186 +43,756 @@ KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
 )
 kusto = KustoClient(KCSB)
 DB = os.environ.get("KUSTO_DATABASE", "")
-CLUSTER_URI = os.environ.get("KUSTO_SERVICE_URI", "")
 
-# Initialize the MCP server with your tools
+# ISPPLANTDATA schema so the tool list_table_schema is not required 
+ISP_TABLE   = "ISPPLANTDATA"
+ISP_TAG_COL = "TagName"
+ISP_VAL_COL = "Value"
+ISP_TS_COL  = "Timestamp"
+
+
+WEATHER_SERVICE_URI = os.environ.get("KUSTO_WEATHER_SERVICE_URI", "")
+if not WEATHER_SERVICE_URI:
+    _dbg("ERROR: Missing KUSTO_WEATHER_SERVICE_URI")
+    raise ValueError("Missing Kusto weather cluster URI (set KUSTO_WEATHER_SERVICE_URI).")
+if not WEATHER_SERVICE_URI.startswith("https://"):
+    WEATHER_SERVICE_URI = "https://" + WEATHER_SERVICE_URI
+
+WEATHER_KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
+    WEATHER_SERVICE_URI,
+    os.environ.get("AZURE_CLIENT_ID", ""),
+    os.environ.get("AZURE_CLIENT_SECRET", ""),
+    os.environ.get("AZURE_TENANT_ID", ""),
+)
+weather_client = KustoClient(WEATHER_KCSB)
+WEATHER_DB = os.environ.get("WEATHER_DB", "")
+if not WEATHER_DB:
+    _dbg("ERROR: Missing weather database name (set WEATHER_DB).")
+    raise ValueError("Missing Kusto weather database name.")
+
+
 mcp = FastMCP(name="fabric-eventhouse-mcp", description="MCP server for Fabric Eventhouse tools")
 
-# ──────────────────────────────────────────────────────────
-# Time & Weather tools
-# ──────────────────────────────────────────────────────────
 
-@mcp.tool()
-def TimeTool(input_timezone: Optional[str] = None) -> str:
-    """
-    Provides the current time for a given timezone like Asia/Kolkata.
-    If no timezone is provided, returns local time.
-    """
-    fmt = "%Y-%m-%d %H:%M:%S %Z%z"
-    now = datetime.datetime.now()
-    if input_timezone:
-        try:
-            now = now.astimezone(ZoneInfo(input_timezone))
-        except Exception as e:
-            logger.error("Invalid timezone %s: %s", input_timezone, e)
-            return f"Error: '{input_timezone}' is not a valid timezone."
-    return f"The current time is {now.strftime(fmt)}."
-
-@mcp.tool(description="Get weather data (current, forecast, or historical) from WeatherAPI.com")
-def weather_tool(
-    location: str,
-    date: Optional[str] = None,
-    forecast_days: int = 0
-) -> Dict[str, Any]:
-    """
-    location: city name or lat,long
-    date:   YYYY-MM-DD if you want historical weather
-    forecast_days: number of days ahead if you want a forecast
-    If neither date nor forecast_days is set, returns current weather.
-    """
-    api_key = os.getenv("WEATHERAPI_API_KEY", "3e4ebd0c4cf54473994103714252907")
-    base = "http://api.weatherapi.com/v1"
-    
-    if date:
-        endpoint = "history.json"
-        params = {"key": api_key, "q": location, "dt": date}
-    elif forecast_days and forecast_days > 0:
-        endpoint = "forecast.json"
-        params = {"key": api_key, "q": location, "days": forecast_days}
-    else:
-        endpoint = "current.json"
-        params = {"key": api_key, "q": location, "aqi": "no"}
-
-    resp = requests.get(f"{base}/{endpoint}", params=params)
-    data = resp.json()
-    
-    return data
-
-# ──────────────────────────────────────────────────────────
-# Kusto helper functions
-# ──────────────────────────────────────────────────────────
-
-def format_results(
-    result_set: Optional[KustoResponseDataSet],
-) -> List[Dict[str, Any]]:
-    """Format Kusto response into list of dictionaries."""
+def format_results(result_set: Optional[KustoResponseDataSet]) -> List[Dict[str, Any]]:
     if not result_set or not getattr(result_set, "primary_results", None):
         return []
     first = result_set.primary_results[0]
     cols = [col.column_name for col in first.columns]
     return [dict(zip(cols, row)) for row in first.rows]
 
-def execute_kusto(
-    query: str, database: str = DB, readonly: bool = True
-) -> List[Dict[str, Any]]:
-    """Execute a Kusto query and return formatted results."""
+def execute_kusto(query: str, client: KustoClient, database: str, readonly: bool = True) -> List[Dict[str, Any]]:
     crp = ClientRequestProperties()
     crp.application = "fabric-eventhouse-mcp"
     crp.client_request_id = f"MCP:{uuid.uuid4()}"
     if readonly:
         crp.set_option("request_readonly", True)
-    result = kusto.execute(database, query, crp)
-    return format_results(result)
+    q_preview = (query or "")[:500].replace("\n", " ")
+    _dbg(f"[execute_kusto] DB={database}  Query(<=500ch): {q_preview}")
+    try:
+        response = client.execute(database, query, crp)
+        rows = format_results(response)
+        _dbg(f"[execute_kusto] Returned rows: {len(rows)}")
+        return rows
+    except Exception as e:
+        _dbg(f"[execute_kusto] ERROR: {e}")
+        raise
 
-# ──────────────────────────────────────────────────────────
-# Kusto‑based MCP tools
-# ──────────────────────────────────────────────────────────
-
-@mcp.tool(description="List all table names in the specified Kusto database. Use this to explore what data sources are available.")
-def list_tables(database: str = DB) -> str:
-    rows = kusto.execute(database, ".show tables").primary_results[0]
-    names = [r["TableName"] for r in rows]
-    return "\n".join(names)
-
-@mcp.tool(description="Return the full JSON schema (column names, types) for a specified table in the database.")
-def table_schema(table: str, database: str = DB) -> str:
-    result = kusto.execute(database, f".show table {table} cslschema")
-    return result.primary_results[0][0]["Schema"]
-
-@mcp.tool(description="Run a read-only Kusto Query Language (KQL) query on the specified database and return the results.")
-def kusto_query(query: str, database: str = DB) -> List[Dict[str, Any]]:
-    return execute_kusto(query, database, readonly=True)
-
-@mcp.tool(description="Execute a Kusto management command")
-def kusto_command(command: str, database: str = DB) -> List[Dict[str, Any]]:
-    return execute_kusto(command, database, readonly=True)
-
-@mcp.tool(description="List all available databases in the connected Kusto cluster. Useful to discover valid targets for queries.")
-def kusto_list_databases() -> List[Dict[str, Any]]:
-    return execute_kusto(".show databases", DB, readonly=True)
-
-@mcp.tool(description="List all tables in the specified database")
-def kusto_list_tables(database: str = DB) -> List[Dict[str, Any]]:
-    return execute_kusto(".show tables", database, readonly=True)
-
-@mcp.tool(description="Get schema information for all entities in the database")
-def kusto_get_entities_schema(database: str = DB) -> List[Dict[str, Any]]:
-    q = (
-        ".show databases entities with (showObfuscatedStrings=true) "
-        f"| where DatabaseName == '{database}' "
-        "| project EntityName, EntityType, Folder, DocString"
+def _sql_conn():
+    driver = '{ODBC Driver 17 for SQL Server}'
+    server = os.getenv("SQL_SERVER_HOST", "")
+    database = os.getenv("SQL_SERVER_DB", "")
+    client_id = os.getenv("AZURE_CLIENT_ID", "")
+    client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
+    _dbg(f"[SQL] Connecting to {server} / DB={database} (AAD SPN)")
+    conn_str = (
+        f"Driver={driver};Server={server},1433;Database={database};"
+        "Encrypt=yes;TrustServerCertificate=no;"
+        "Authentication=ActiveDirectoryServicePrincipal;"
+        f"UID={client_id};PWD={client_secret}"
     )
-    return execute_kusto(q, database, readonly=True)
+    return pyodbc.connect(conn_str)
 
-@mcp.tool(description="Retrieve the column schema and types for a specific table in the given Kusto database.")
-def kusto_get_table_schema(
-    table_name: str, database: str = DB
-) -> List[Dict[str, Any]]:
-    return execute_kusto(f".show table {table_name} cslschema", database, readonly=True)
+def _parse_iso_dt(s: Optional[str], default_dt: datetime.datetime) -> datetime.datetime:
+    if not s:
+        return default_dt
+    try:
+        s2 = s.strip()
+        if s2.endswith("Z"):
+            s2 = s2[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception as e:
+        raise ValueError(f"Invalid ISO time '{s}': {e}")
 
-@mcp.tool(description="Retrieve the function definition and metadata for a specified Kusto function within the given database.")
-def kusto_get_function_schema(
-    function_name: str, database: str = DB
-) -> List[Dict[str, Any]]:
-    return execute_kusto(f".show function {function_name}", database, readonly=True)
+def _utc_str(dt: datetime.datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-@mcp.tool(description="Return a random sample of records from a specific table in the database. Useful for quick previews.")
-def kusto_sample_table_data(
-    table_name: str, sample_size: int = 10, database: str = DB
-) -> List[Dict[str, Any]]:
-    return execute_kusto(f"{table_name} | sample {sample_size}", database, readonly=True)
+def _escape_sql_literal(s: str) -> str:
+    return s.replace("'", "''")
 
-@mcp.tool(description="Sample random records from a function call result")
-def kusto_sample_function_data(
-    function_call_with_params: str,
-    sample_size: int = 10,
-    database: str = DB,
-) -> List[Dict[str, Any]]:
-    return execute_kusto(
-        f"{function_call_with_params} | sample {sample_size}", database, readonly=True
-    )
+_escape_kql_literal = _escape_sql_literal
 
-@mcp.tool(description="Get cluster information")
-def kusto_get_clusters() -> List[tuple]:
-    return [(CLUSTER_URI, "Primary cluster")]
+PERF_WORDS = re.compile(r"\b(analy[sz]e|analysis|evaluate|evaluation|trend|trends|impact|performance|health|efficien|stability|overview)\b", re.I)
 
-@mcp.tool(
-    description="Get semantically similar shots from a shots table"
-)
-def kusto_get_shots(
-    prompt: str,
-    shots_table_name: str,
-    sample_size: int = 3,
-    database: str = DB,
-    embedding_endpoint: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    endpoint = embedding_endpoint or os.getenv("AZ_OPENAI_EMBEDDING_ENDPOINT", "")
-    if not endpoint:
-        raise ValueError("No embedding endpoint provided.")
-    kql = f"""
-        let model_endpoint = '{endpoint}';
-        let embedded_term = toscalar(evaluate ai_embeddings('{prompt}', model_endpoint));
-        {shots_table_name}
-        | extend similarity = series_cosine_similarity(embedded_term, EmbeddingVector)
-        | top {sample_size} by similarity
-        | project similarity, EmbeddingText, AugmentedText
+def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datetime] = None) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
     """
-    return execute_kusto(kql, database, readonly=True)
+      'last 7 days', 'last 1 week', 'past 24 hours', '7d', '24h', '1w', 'last week'
+    Returns (start_dt_utc, end_dt_utc) or None if not parsed.
+    """
+    if not relative:
+        return None
+    text = relative.strip().lower()
+    if not text:
+        return None
+    if now is None:
+        now = datetime.datetime.now(timezone.utc)
+    end_dt = now
 
-# ──────────────────────────────────────────────────────────
+    # direct forms: 7d, 24h, 1w
+    m = re.fullmatch(r"(\d+)\s*([dhw])", text)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "h":
+            return (end_dt - timedelta(hours=n), end_dt)
+        if unit == "d":
+            return (end_dt - timedelta(days=n), end_dt)
+        if unit == "w":
+            return (end_dt - timedelta(days=7*n), end_dt)
+
+    # phrases: last/past N days/weeks/hours
+    m = re.search(r"(last|past)\s+(\d+)\s*(day|days|d|week|weeks|w|hour|hours|h)", text)
+    if m:
+        n = int(m.group(2))
+        unit = m.group(3)[0]
+        if unit == "h":
+            return (end_dt - timedelta(hours=n), end_dt)
+        if unit == "d":
+            return (end_dt - timedelta(days=n), end_dt)
+        if unit == "w":
+            return (end_dt - timedelta(days=7*n), end_dt)
+
+    # "last week" -> 7 days
+    if text in ("last week", "past week"):
+        return (end_dt - timedelta(days=7), end_dt)
+
+    # "last 24 hours"
+    if text in ("last 24 hours", "past 24 hours"):
+        return (end_dt - timedelta(hours=24), end_dt)
+
+    return None
+
+def _normalize_period(period: Optional[str]) -> Optional[str]:
+    """
+    Normalize human-friendly period to Kusto timespan literal.
+    Returns None if not set.
+    """
+    if not period:
+        return None
+    t = str(period).strip().lower()
+
+    if t in ("hour", "hourly", "per hour"):  return "1h"
+    if t in ("day", "daily", "per day"):     return "1d"
+    if t in ("week", "weekly", "per week"):  return "7d"
+    if t in ("month", "monthly", "per month"):  return "30d"
+
+    # 1w -> 7d
+    m = re.fullmatch(r"(\d+)\s*w", t)
+    if m:
+        return f"{int(m.group(1)) * 7}d"
+
+    # Accept raw Kusto-like spans: 1h, 2h, 1d, 3d, 12h, etc.
+    if re.fullmatch(r"\d+\s*[smhd]", t):
+        return t.replace(" ", "")
+
+    return t  # pass-through (let Kusto complain if invalid)
+
+# Fixed EPF JT tag set (in-memory)
+FIXED_TAGS: Dict[str, str] = {
+    "400JTPIT4031/PV.CV": "EPF JT INLET EXCHANGER GAS PRESSURE (E-403A/B)",
+    "400JTPIT4050/PV.CV": "EPF JT COLD SEPARATOR PRESSURE",
+    "400JTTIT4031/PV.CV": "EPF JT INLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+    "400JTTIT4030/PV.CV": "EPF JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+    "400JTPIT4010/PV.CV": "EPF JT SKID INLET PRESSURE",
+    "400JTTIT4010/PV.CV": "EPF JT INLET GAS TEMPERATURE (E-401A/B/C)",
+    "400JTTIT4012/PV.CV": "EPF JT CONDITIONNED GAS TEMPERATURE",
+    "400JTPIT4030/PV.CV": "EPF JT E-402 DISCHARGE PRESSURE",
+    "400JTPIT4032/PV.CV": "EPF JT OUTLET EXCHANGER GAS PRESSURE (E-403A/B)",
+    "400JTTIT4032/PV.CV": "EPF JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+    "400JTTIT4050/PV.CV": "EPF JT COLD SEPARATOR TEMPERATURE",
+    "400JTPIT4011/PV.CV": "EPF JT CONDITIONNED GAS PRESSURE",
+    "400JTTIT4011/PV.CV": "EPF JT E-401/A/B/C OUTLET TEMPERATURE",
+    "400FI401/PV.CV":     "GAS TO EPF COLD EXCHANGER",
+    "400PIC010/PV.CV":    "EPF COMP SUCTION TO FLARE",
+}
+
+def _fixed_search(query: str, threshold: int = 60) -> List[Tuple[str, str]]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    results: List[Tuple[str, str, int]] = []
+    for tag, desc in FIXED_TAGS.items():
+        score_desc = fuzz.partial_ratio(q, desc.lower())
+        score_tag  = fuzz.partial_ratio(q, tag.lower())
+        score = max(score_desc, score_tag)
+        if score >= threshold:
+            results.append((tag, desc, score))
+    results.sort(key=lambda x: x[2], reverse=True)
+    hits = [(tag, desc) for tag, desc, _ in results]
+    _dbg(f"[resolver] Query='{query}'  Threshold={threshold}  Matches={len(hits)}")
+    for t, d in hits:
+        _dbg(f"[resolver]  -> {t} :: {d}")
+    return hits
+
+def _resolve_tags_for_query(query: str, default_all_if_perf: bool = True) -> List[str]:
+    """If query is generic 'performance/analysis/trend/etc', return ALL tags; else fuzzy resolve."""
+    q = (query or "").strip()
+    if default_all_if_perf and PERF_WORDS.search(q):
+        tags = list(FIXED_TAGS.keys())
+        _dbg(f"[resolve_tags] Performance-style query detected -> ALL tags ({len(tags)})")
+        return tags
+    # try fuzzy matches first
+    pairs = _fixed_search(q)
+    tags = [t for t, _ in pairs]
+    if not tags and "/" in q:
+        tags = [q]  
+    if not tags and default_all_if_perf:
+        # if vague short ask like "performance?" — return all
+        if len(q.split()) <= 2:
+            tags = list(FIXED_TAGS.keys())
+            _dbg(f"[resolve_tags] Very vague query -> ALL tags ({len(tags)})")
+    tags = sorted(set(tags))
+    _dbg(f"[resolve_tags] Resolved={tags}")
+    return tags
+def _get_weather_for_window(
+    start_time: Optional[str], 
+    end_time: Optional[str], 
+    relative: Optional[str],
+    period: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    # If user didn't specify period, default to 30m
+    bin_period = period or "30m"
+    return plant_weather(
+        start_time=start_time,
+        end_time=end_time,
+        agg="avg",
+        period=bin_period,
+        weather_database=WEATHER_DB
+    )
+
+
+# pid.txt context loader
+_PID_CACHE: Dict[str, Any] = {"text": None, "mtime": None, "path": None}
+
+def _load_pid_text() -> str:
+    path = Path(__file__).parent / "pid.txt"
+    try:
+        stat = path.stat()
+    except Exception:
+        _dbg("[pid] pid.txt not found next to server.py")
+        _PID_CACHE.update({"text": "", "mtime": None, "path": str(path)})
+        return ""
+    mtime = stat.st_mtime
+    if _PID_CACHE["text"] is None or _PID_CACHE["mtime"] != mtime:
+        try:
+            txt = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            _dbg(f"[pid] Error reading pid.txt: {e}")
+            txt = ""
+        _PID_CACHE.update({"text": txt, "mtime": mtime, "path": str(path)})
+        _dbg(f"[pid] Loaded pid.txt from {path} ({len(txt)} chars)")
+    return _PID_CACHE["text"] or ""
+
+
+
+
+# Time tool (in case it is required by the mcp to get the current time with zone)
+@mcp.tool()
+def TimeTool(input_timezone: Optional[str] = None) -> str:
+    fmt = "%Y-%m-%d %H:%M:%S %Z%z"
+    now = datetime.datetime.now()
+    if input_timezone:
+        try:
+            now = now.astimezone(ZoneInfo(input_timezone))
+        except Exception as e:
+            _dbg(f"[TimeTool] Invalid timezone '{input_timezone}': {e}")
+            return f"Error: '{input_timezone}' is not a valid timezone."
+    out = f"The current time is {now.strftime(fmt)}."
+    _dbg(f"[TimeTool] {out}")
+    return out
+
+
+# Generic Kusto query (read-only)
+@mcp.tool(description="Run a read-only KQL query on the specified database ISPPLANTDATA and return the results.")
+def kusto_query(query: str, database: str = DB) -> List[Dict[str, Any]]:
+    _dbg(f"[kusto_query] DB={database}")
+    return execute_kusto(query=query, client=kusto, database=database)
+
+
+# ISPPLANTDATA tools (with relative window + fallback)
+@mcp.tool(description=f"Return the full JSON schema for the {ISP_TABLE} table in the database.")
+def isp_table_schema(database: str = DB) -> str:
+    rows = execute_kusto(
+        query=f".show table {ISP_TABLE} cslschema",
+        client=kusto,
+        database=database
+    )
+    _dbg(f"[isp_table_schema] Schema rows={len(rows)}")
+    return rows[0]["Schema"] if rows else ""
+
+def _build_tokens_for_fallback(tags: List[str]) -> List[str]:
+    tokens: List[str] = []
+    for t in tags:
+        t = t.strip()
+        if not t:
+            continue
+        tokens.append(t)
+        if "/" in t:
+            base = t.split("/", 1)[0].strip()
+            if base:
+                tokens.append(base)
+    seen = set()
+    out = []
+    for x in tokens:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+@mcp.tool(description=f"Fetch raw rows from {ISP_TABLE} for the provided comma-separated tag list, with optional time window or limit. You can also pass relative='last 7 days' etc.")
+def isp_get_tags_data(
+    tag_names: str,
+    start_time: Optional[str] = None,
+    end_time:   Optional[str] = None,
+    limit:      Optional[int] = None,
+    database:   str = DB,
+    relative:   Optional[str] = None,   # NEW
+) -> List[Dict[str, Any]]:
+    tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
+    _dbg(f"[isp_get_tags_data] Input tags={tags}  limit={limit}  DB={database}  relative={relative}")
+    if not tags:
+        return []
+
+    tags_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tags) + "]"
+
+    now = datetime.datetime.now(timezone.utc)
+
+    # Relative window takes precedence if provided
+    if relative:
+        win = _parse_relative_window(relative, now)
+        if win:
+            start_time = _utc_str(win[0])
+            end_time   = _utc_str(win[1])
+            _dbg(f"[isp_get_tags_data] Parsed relative='{relative}' -> {start_time} .. {end_time}")
+
+    if limit:
+        kql = (
+            f"{ISP_TABLE} "
+            f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
+            f"| sort by {ISP_TS_COL} desc "
+            f"| take {int(limit)} "
+            f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL}"
+        )
+        rows = execute_kusto(query=kql, client=kusto, database=database)
+        if len(rows) == 0:
+            _dbg("[isp_get_tags_data] No rows (exact IN). Trying fallback: has_any/contains with tokens...")
+            tokens = _build_tokens_for_fallback(tags)
+            tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
+            kql_fb = (
+                f"{ISP_TABLE} "
+                f"| sort by {ISP_TS_COL} desc "
+                f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
+                f"| take {int(limit)} "
+                f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL}"
+            )
+            rows = execute_kusto(query=kql_fb, client=kusto, database=database)
+        _dbg(f"[isp_get_tags_data] Rows returned={len(rows)}")
+        return rows
+
+    try:
+        end_dt   = _parse_iso_dt(end_time, now)
+        start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
+    except ValueError as e:
+        _dbg(f"[isp_get_tags_data] Time parsing error: {e}")
+        return [{"error": str(e)}]
+
+    if start_dt > end_dt:
+        _dbg("[isp_get_tags_data] start_dt > end_dt; swapping.")
+        start_dt, end_dt = end_dt, start_dt
+
+    start_str = _utc_str(start_dt)
+    end_str   = _utc_str(end_dt)
+    _dbg(f"[isp_get_tags_data] Window UTC: {start_str} .. {end_str}")
+
+    kql = (
+        f"{ISP_TABLE} "
+        f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+        f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
+        f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
+        f"| order by {ISP_TS_COL} asc"
+    )
+    rows = execute_kusto(query=kql, client=kusto, database=database)
+    if len(rows) == 0:
+        _dbg("[isp_get_tags_data] No rows (exact IN). Trying fallback: has_any/contains with tokens...")
+        tokens = _build_tokens_for_fallback(tags)
+        tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
+        kql_fb = (
+            f"{ISP_TABLE} "
+            f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+            f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
+            f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
+            f"| order by {ISP_TS_COL} asc"
+        )
+        rows = execute_kusto(query=kql_fb, client=kusto, database=database)
+
+        if len(rows) == 0:
+            ors = " or ".join(f'{ISP_TAG_COL} contains "{_escape_kql_literal(t)}"' for t in tokens)
+            kql_fb2 = (
+                f"{ISP_TABLE} "
+                f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+                f"| where {ors} "
+                f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
+                f"| order by {ISP_TS_COL} asc"
+            )
+            rows = execute_kusto(query=kql_fb2, client=kusto, database=database)
+
+    _dbg(f"[isp_get_tags_data] Rows returned={len(rows)}")
+    return rows
+
+@mcp.tool(description=f"Summarize {ISP_TABLE} over time for tags. Supports agg in (avg,min,max,sum,count) and optional bin period like 1h/1d. You can pass relative='last 7 days' etc.")
+def isp_stats(
+    tag_names: str,
+    agg: str = "avg",
+    period: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    database: str = DB,
+    relative: Optional[str] = None,   # NEW
+) -> List[Dict[str, Any]]:
+    tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
+    _dbg(f"[isp_stats] tags={tags} agg={agg} period={period} DB={database} relative={relative}")
+    if not tags:
+        return [{"error": "No tags provided"}]
+
+    agg_l = agg.lower().strip()
+    if agg_l not in ("avg", "min", "max", "sum", "count"):
+        return [{"error": f"Unsupported agg '{agg}'. Use avg,min,max,sum,count."}]
+
+    now = datetime.datetime.now(timezone.utc)
+
+    if relative:
+        win = _parse_relative_window(relative, now)
+        if win:
+            start_time = _utc_str(win[0])
+            end_time   = _utc_str(win[1])
+            _dbg(f"[isp_stats] Parsed relative='{relative}' -> {start_time} .. {end_time}")
+
+    try:
+        end_dt   = _parse_iso_dt(end_time, now)
+        start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
+    except ValueError as e:
+        return [{"error": str(e)}]
+
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    start_str = _utc_str(start_dt)
+    end_str   = _utc_str(end_dt)
+    _dbg(f"[isp_stats] Window UTC: {start_str} .. {end_str}")
+
+    span = _normalize_period(period)
+    tags_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tags) + "]"
+
+    if span:
+        kql = (
+            f"{ISP_TABLE} "
+            f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+            f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
+            f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {span}) "
+            f"| order by {ISP_TS_COL} asc"
+        )
+    else:
+        kql = (
+            f"{ISP_TABLE} "
+            f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+            f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
+            f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}"
+        )
+    rows = execute_kusto(query=kql, client=kusto, database=database)
+    if len(rows) == 0:
+        _dbg("[isp_stats] No rows with exact IN. Trying fallback has_any...")
+        tokens = _build_tokens_for_fallback(tags)
+        tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
+        if span:
+            kql_fb = (
+                f"{ISP_TABLE} "
+                f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+                f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
+                f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {span}) "
+                f"| order by {ISP_TS_COL} asc"
+            )
+        else:
+            kql_fb = (
+                f"{ISP_TABLE} "
+                f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
+                f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
+                f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}"
+            )
+        rows = execute_kusto(query=kql_fb, client=kusto, database=database)
+
+    _dbg(f"[isp_stats] Rows returned={len(rows)}")
+    return rows
+
+
+# Fixed tag tools
+@mcp.tool(description="List the fixed EPF JT tags (in-memory) with descriptions.")
+def fixed_tags_all() -> List[Dict[str, str]]:
+    out = [{"tag": t, "desc": d} for t, d in FIXED_TAGS.items()]
+    _dbg(f"[fixed_tags_all] Count={len(out)}")
+    return out
+
+@mcp.tool(description="Look up the fixed EPF JT tags by tag/prefix or by keywords like 'temperature' or 'pressure'. Returns matching tags with descriptions.")
+def fixed_tags_lookup(query: str) -> List[Dict[str, str]]:
+    _dbg(f"[fixed_tags_lookup] query='{query}'")
+    pairs = _fixed_search(query)
+    out = [{"tag": t, "desc": d} for t, d in pairs]
+    _dbg(f"[fixed_tags_lookup] Matches={len(out)}")
+    return out
+
+@mcp.tool(description="Get description for a specific tag from the fixed set only. Returns {'tag','desc','source'='fixed'|'not_found'}.")
+def fixed_tag_describe(tag_name: str) -> Dict[str, Any]:
+    tag = (tag_name or "").strip()
+    _dbg(f"[fixed_tag_describe] tag_name='{tag}'")
+    if not tag:
+        return {"error": "tag_name is required"}
+    if tag in FIXED_TAGS:
+        out = {"tag": tag, "desc": FIXED_TAGS[tag], "source": "fixed"}
+        _dbg(f"[fixed_tag_describe] HIT fixed -> {out}")
+        return out
+    _dbg("[fixed_tag_describe] NOT FOUND")
+    return {"tag": tag, "desc": None, "source": "not_found"}
+
+
+# P&ID context tool (reads local pid.txt)
+
+@mcp.tool(description="Fetch P&ID context from local pid.txt. Returns full file and automatically fetches weather for the same period if available.")
+def pid_context(tags: Optional[str] = None,
+                start_time: Optional[str] = None,
+                end_time: Optional[str] = None,
+                relative: Optional[str] = None,
+                period: Optional[str] = None) -> Dict[str, Any]:
+    _dbg(f"[pid_context] tags={tags} start={start_time} end={end_time} relative={relative} period={period}")
+    txt = _load_pid_text()
+    if not txt:
+        return {
+            "source": _PID_CACHE["path"],
+            "matched": [],
+            "snippet": "",
+            "note": "pid.txt missing or empty",
+            "weather": []
+        }
+
+    try:
+        weather_data = _get_weather_for_window(start_time, end_time, relative, period=period)
+    except Exception as e:
+        _dbg(f"[pid_context] Weather fetch error: {e}")
+        weather_data = []
+
+    return {
+        "source": _PID_CACHE["path"],
+        "matched": [],
+        "snippet": txt,
+        "note": "Full file returned",
+        "weather": weather_data
+    }
+
+
+
+
+# One-shot context query (resolve → values → P&ID from pid.txt)
+@mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then fetch ISPPLANTDATA values. Use limit for latest N; otherwise supply a time window or relative='last 7 days'. Returns values + in-memory tag desc + local pid.txt context.")
+def context_values_by_query(
+    query: str,
+    start_time: Optional[str] = None,
+    end_time:   Optional[str] = None,
+    limit:      Optional[int] = None,
+    database:   str = DB,
+    relative:   Optional[str] = None,
+    period: Optional[str] = None   # NEW
+) -> Dict[str, Any]:
+    _dbg(f"[context_values_by_query] query='{query}' limit={limit} start={start_time} end={end_time} DB={database} relative={relative} period={period}")
+    tags = _resolve_tags_for_query(query, default_all_if_perf=True)
+    _dbg(f"[context_values_by_query] tags_resolved={tags}")
+    if not tags:
+        return {"tags_resolved": [], "note": "No tags matched your query."}
+
+    tags_csv = ",".join(tags)
+
+    # Fetch values (limit or window with relative support)
+    if limit:
+        values = isp_get_tags_data(tag_names=tags_csv, limit=limit, database=database)
+    else:
+        values = isp_get_tags_data(tag_names=tags_csv, start_time=start_time, end_time=end_time, database=database, relative=relative)
+    _dbg(f"[context_values_by_query] values_rows={len(values)}")
+
+    # In-memory descriptions & local P&ID context
+    inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
+    pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=period)
+
+    # Attach weather if this is a performance/trend/analysis ask
+    weather_data = pid.get("weather", [])
+    if PERF_WORDS.search(query or ""):
+        try:
+            weather_data = _get_weather_for_window(start_time, end_time, relative, period=period)
+        except Exception as e:
+            _dbg(f"[context_values_by_query] Weather fetch error: {e}")
+
+    out = {
+        "tags_resolved": tags,
+        "tag_context_in_memory": inmem,
+        "values": values,
+        "pid_context": pid,
+        "weather": weather_data
+    }
+    return out
+
+# Aggregate (defaults to hourly bins if not specified) + P&ID context
+@mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
+def isp_aggregate_for_query(
+    query: Optional[str] = None,
+    tag_names: Optional[str] = None,
+    agg: str = "avg",
+    period: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    database: str = DB,
+    relative: Optional[str] = None,     # NEW
+) -> Dict[str, Any]:
+    _dbg(f"[isp_aggregate_for_query] query='{query}' tag_names='{tag_names}' agg={agg} period={period} start={start_time} end={end_time} DB={database} relative={relative}")
+
+    if tag_names:
+        tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
+    else:
+        tags = _resolve_tags_for_query(query or "", default_all_if_perf=True)
+
+    _dbg(f"[isp_aggregate_for_query] tags_resolved={tags}")
+    if not tags:
+        return {"tags_resolved": [], "note": "No tags found to aggregate."}
+
+    # Default resolution: hourly if not specified
+    span = _normalize_period(period) or "1h"
+
+    rows = isp_stats(
+        tag_names=",".join(tags),
+        agg=agg,
+        period=span,
+        start_time=start_time,
+        end_time=end_time,
+        database=database,
+        relative=relative,
+    )
+
+    inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
+    pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=span)
+
+    out: Dict[str, Any] = {
+        "tags_resolved": tags,
+        "aggregate": agg,
+        "period": span,
+        "results": rows,
+        "time_window": {"start_time": start_time, "end_time": end_time, "relative": relative},
+        "tag_context_in_memory": inmem,
+        "pid_context": pid,
+    }
+
+    _dbg(f"[isp_aggregate_for_query] results_rows={len(rows)}")
+    return out
+
+# Weather tool
+@mcp.tool(
+    description="Fetch plant weather data from KM400WeatherDataTBL. Supports raw rows, top-N latest, or aggregated (avg/min/max/sum/count) over a time window with optional binning."
+)
+def plant_weather(
+    start_time: Optional[str] = None,
+    end_time:   Optional[str] = None,
+    agg:        Optional[str] = None,
+    period:     Optional[str] = None,
+    limit:      Optional[int] = None,
+    weather_database: str = WEATHER_DB
+) -> List[Dict[str, Any]]:
+    _dbg(f"[plant_weather] agg={agg} period={period} limit={limit} start={start_time} end={end_time} DB={weather_database}")
+    now = datetime.datetime.now(timezone.utc)
+
+    if limit:
+        kql = (
+            "KM400WeatherDataTBL "
+            "| sort by Timestamp desc "
+            f"| take {int(limit)}"
+        )
+        rows = execute_kusto(query=kql, client=weather_client, database=weather_database)
+        _dbg(f"[plant_weather] rows={len(rows)} (latest mode)")
+        return rows
+
+    try:
+        end_dt   = _parse_iso_dt(end_time, now)
+        start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
+    except ValueError as e:
+        _dbg(f"[plant_weather] Time parsing error: {e}")
+        return [{"error": str(e)}]
+
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    start_str = _utc_str(start_dt)
+    end_str   = _utc_str(end_dt)
+    _dbg(f"[plant_weather] Window UTC: {start_str} .. {end_str}")
+
+    if agg:
+        agg_l = agg.lower()
+        if agg_l not in ("avg", "min", "max", "sum", "count"):
+            return [{"error": f"Unsupported agg '{agg}'. Use avg,min,max,sum,count."}]
+
+        span = _normalize_period(period)
+        metrics = [
+            "temp", "heatIndex", "windChill", "windSpeed", "windGust",
+            "pressure", "precipRate", "precipTotal", "winddir", "humidity"
+        ]
+        agg_exprs = ", ".join([f"{agg_l}_{m} = {agg_l}({m})" for m in metrics])
+
+        if span:
+            kql = (
+                "KM400WeatherDataTBL "
+                f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
+                f"| summarize {agg_exprs} by bin(Timestamp, {span}) "
+                "| order by Timestamp asc"
+            )
+        else:
+            kql = (
+                "KM400WeatherDataTBL "
+                f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
+                f"| summarize {agg_exprs}"
+            )
+
+        rows = execute_kusto(query=kql, client=weather_client, database=weather_database)
+        _dbg(f"[plant_weather] rows={len(rows)} (agg mode - all metrics)")
+        return rows
+
+    # Raw mode: fetch all metrics
+    kql = (
+        "KM400WeatherDataTBL "
+        f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
+        "| project Timestamp, temp, heatIndex, windChill, windSpeed, windGust, pressure, precipRate, precipTotal, winddir, humidity"
+    )
+    rows = execute_kusto(query=kql, client=weather_client, database=weather_database)
+    _dbg(f"[plant_weather] rows={len(rows)} (raw mode)")
+    return rows
+
+
+
 # SSE transport & application setup
-# ──────────────────────────────────────────────────────────
-
 transport = SseServerTransport("/messages/")
 
 async def handle_sse(request):
@@ -231,7 +805,6 @@ async def handle_sse(request):
             mcp._mcp_server.create_initialization_options()
         )
 
-# Starlette app for SSE endpoints
 sse_app = Starlette(
     routes=[
         Route("/sse", handle_sse, methods=["GET"]),
@@ -239,7 +812,6 @@ sse_app = Starlette(
     ]
 )
 
-# Main FastAPI app
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -255,4 +827,5 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
+    _dbg("Starting MCP server on 0.0.0.0:8000 ...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
