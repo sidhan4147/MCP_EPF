@@ -175,7 +175,10 @@ def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datet
             return (end_dt - timedelta(days=n), end_dt)
         if unit == "w":
             return (end_dt - timedelta(days=7*n), end_dt)
-
+    m = re.search(r"(last|past)\s+(\d+)\s*(month|months|mo)", text)
+    if m:
+        n = int(m.group(2))
+        return (end_dt - timedelta(days=30*n), end_dt)
     # "last week" -> 7 days
     if text in ("last week", "past week"):
         return (end_dt - timedelta(days=7), end_dt)
@@ -183,6 +186,9 @@ def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datet
     # "last 24 hours"
     if text in ("last 24 hours", "past 24 hours"):
         return (end_dt - timedelta(hours=24), end_dt)
+    # "last month" -> 30 days
+    if text in ("last month", "past month"):
+        return (end_dt - timedelta(days=30), end_dt)
 
     return None
 
