@@ -211,6 +211,45 @@ def _normalize_period(period: Optional[str]) -> Optional[str]:
 
     return t  # pass-through (let Kusto complain if invalid)
 
+LONG_WINDOW_THRESHOLD_DAYS = 15
+MIN_BIN_FOR_LONG_WINDOWS = "6h"
+
+def _span_to_timedelta(span: Optional[str]) -> Optional[datetime.timedelta]:
+    """
+    Convert a Kusto-like timespan string ('30m','1h','12h','1d','7d') to timedelta.
+    Returns None if span is None or unparseable.
+    """
+    if not span:
+        return None
+    s = span.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*([smhd])", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "s": return datetime.timedelta(seconds=n)
+    if unit == "m": return datetime.timedelta(minutes=n)
+    if unit == "h": return datetime.timedelta(hours=n)
+    if unit == "d": return datetime.timedelta(days=n)
+    return None
+
+def _coerce_min_bin_for_window(span: Optional[str],
+                               start_dt: datetime.datetime,
+                               end_dt: datetime.datetime,
+                               threshold_days: int = LONG_WINDOW_THRESHOLD_DAYS,
+                               min_span: str = MIN_BIN_FOR_LONG_WINDOWS) -> Optional[str]:
+    """
+    If window length > threshold_days and span < min_span (or missing), coerce to min_span.
+    Applied ONLY to ISPPLANTDATA.
+    """
+    window_len = end_dt - start_dt
+    if window_len > datetime.timedelta(days=threshold_days):
+        min_td = _span_to_timedelta(min_span)
+        curr_td = _span_to_timedelta(span)
+        if curr_td is None or (min_td is not None and curr_td < min_td):
+            return min_span
+    return span
+
 # Fixed EPF JT tag set (in-memory)
 FIXED_TAGS: Dict[str, str] = {
     "400JTPIT4031/PV.CV": "EPF JT INLET EXCHANGER GAS PRESSURE (E-403A/B)",
@@ -505,6 +544,9 @@ def isp_stats(
     _dbg(f"[isp_stats] Window UTC: {start_str} .. {end_str}")
 
     span = _normalize_period(period)
+    span_before = span
+    span = _coerce_min_bin_for_window(span, start_dt, end_dt)  # NEw (ISPPLANTDATA only)not weather
+    _dbg(f"[isp_stats] Bin policy: requested={span_before!r} -> used={span!r}; window_days={(end_dt-start_dt).total_seconds()/86400:.2f}")
     tags_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tags) + "]"
 
     if span:
@@ -642,7 +684,8 @@ def context_values_by_query(
     # In-memory descriptions & local P&ID context
     inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
     pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=period)
-
+    # pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=None)
+    
     # Attach weather if this is a performance/trend/analysis ask
     weather_data = pid.get("weather", [])
     if PERF_WORDS.search(query or ""):
@@ -661,6 +704,56 @@ def context_values_by_query(
     return out
 
 # Aggregate (defaults to hourly bins if not specified) + P&ID context
+# @mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
+# def isp_aggregate_for_query(
+#     query: Optional[str] = None,
+#     tag_names: Optional[str] = None,
+#     agg: str = "avg",
+#     period: Optional[str] = None,
+#     start_time: Optional[str] = None,
+#     end_time: Optional[str] = None,
+#     database: str = DB,
+#     relative: Optional[str] = None,     # NEW
+# ) -> Dict[str, Any]:
+#     _dbg(f"[isp_aggregate_for_query] query='{query}' tag_names='{tag_names}' agg={agg} period={period} start={start_time} end={end_time} DB={database} relative={relative}")
+
+#     if tag_names:
+#         tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
+#     else:
+#         tags = _resolve_tags_for_query(query or "", default_all_if_perf=True)
+
+#     _dbg(f"[isp_aggregate_for_query] tags_resolved={tags}")
+#     if not tags:
+#         return {"tags_resolved": [], "note": "No tags found to aggregate."}
+
+#     # Default resolution: hourly if not specified
+#     span = _normalize_period(period) or "1h"
+
+#     rows = isp_stats(
+#         tag_names=",".join(tags),
+#         agg=agg,
+#         period=span,
+#         start_time=start_time,
+#         end_time=end_time,
+#         database=database,
+#         relative=relative,
+#     )
+
+#     inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
+#     pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=span)
+
+#     out: Dict[str, Any] = {
+#         "tags_resolved": tags,
+#         "aggregate": agg,
+#         "period": span,
+#         "results": rows,
+#         "time_window": {"start_time": start_time, "end_time": end_time, "relative": relative},
+#         "tag_context_in_memory": inmem,
+#         "pid_context": pid,
+#     }
+
+#     _dbg(f"[isp_aggregate_for_query] results_rows={len(rows)}")
+#     return out
 @mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
 def isp_aggregate_for_query(
     query: Optional[str] = None,
@@ -670,7 +763,7 @@ def isp_aggregate_for_query(
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     database: str = DB,
-    relative: Optional[str] = None,     # NEW
+    relative: Optional[str] = None,    
 ) -> Dict[str, Any]:
     _dbg(f"[isp_aggregate_for_query] query='{query}' tag_names='{tag_names}' agg={agg} period={period} start={start_time} end={end_time} DB={database} relative={relative}")
 
@@ -686,27 +779,74 @@ def isp_aggregate_for_query(
     # Default resolution: hourly if not specified
     span = _normalize_period(period) or "1h"
 
+    # --- Derive the actual time window here (same logic as isp_stats) ---
+    now = datetime.datetime.now(timezone.utc)
+    if relative:
+        win = _parse_relative_window(relative, now)
+        if win:
+            start_dt, end_dt = win
+        else:
+            end_dt = now
+            start_dt = end_dt - datetime.timedelta(minutes=15)
+    else:
+        try:
+            end_dt   = _parse_iso_dt(end_time, now)
+            start_dt = _parse_iso_dt(start_time, end_dt - datetime.timedelta(minutes=15))
+        except ValueError as e:
+            return {"tags_resolved": tags, "error": str(e)}
+
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    # --- Enforce bin policy for long windows (ISPPLANTDATA only) ---
+    span_before = span
+    span = _coerce_min_bin_for_window(span, start_dt, end_dt)
+    window_days = (end_dt - start_dt).total_seconds() / 86400.0
+    coerced = (span_before != span)
+    coercion_note = None
+    if coerced:                      # NEW
+        coercion_note = (            # NEW
+            f"Requested period {span_before or 'None'} coerced to {span} "
+            f"because window {window_days:.2f} days exceeds {LONG_WINDOW_THRESHOLD_DAYS}-day minimum-bin policy."
+        )
+    _dbg(f"[isp_aggregate_for_query] Bin policy: requested={span_before!r} -> used={span!r}; window_days={window_days:.2f}")
+    # _dbg(f"[isp_aggregate_for_query] Bin policy: requested={span_before!r} -> used={span!r}; window_days={(end_dt-start_dt).total_seconds()/86400:.2f}")
+
+    # Use the coerced span everywhere downstream for consistency (plant data)
     rows = isp_stats(
         tag_names=",".join(tags),
         agg=agg,
         period=span,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=_utc_str(start_dt),
+        end_time=_utc_str(end_dt),
         database=database,
-        relative=relative,
+        relative=None,  # already resolved
     )
 
     inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
-    pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=span)
+    # IMPORTANT: keep weather independent -> do NOT pass the plant period here
+    pid = pid_context(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), relative=None, period=None)
 
     out: Dict[str, Any] = {
         "tags_resolved": tags,
         "aggregate": agg,
-        "period": span,
+        "period": span,  # report the actual bin used
         "results": rows,
-        "time_window": {"start_time": start_time, "end_time": end_time, "relative": relative},
+        "time_window": {
+            "start_time": _utc_str(start_dt),
+            "end_time": _utc_str(end_dt),
+            "relative": relative,
+        },
         "tag_context_in_memory": inmem,
         "pid_context": pid,
+        "bin_policy": {
+            "requested": span_before,
+            "used": span,
+            "coerced": coerced,
+            "window_days": window_days,
+            "threshold_days": LONG_WINDOW_THRESHOLD_DAYS
+        },
+        "coercion_note": coercion_note,  # string or None
     }
 
     _dbg(f"[isp_aggregate_for_query] results_rows={len(rows)}")

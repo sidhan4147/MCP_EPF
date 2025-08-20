@@ -33,6 +33,10 @@ FOLLOW THESE RULES
        )
    - If the user asks for “hourly/daily/weekly” resolution, set period accordingly (hourly=1h, daily=1d, weekly=7d).
    - The tool returns P&ID context and in-memory tag descriptions alongside results.
+   - Bin policy (ISPPLANTDATA only): If the requested time window is > 15 days and the requested period is missing or < 6h, force 6h bins. Requests for >= 6h (e.g., 12h, 1d) are honored.
+   - Always display the ACTUAL bin used from the tool response:
+    • Use tool_output.period (not the user’s requested period).
+    • If tool_output.bin_policy.coerced is true, explicitly state: "Requested <requested> → Used <used> due to > <threshold_days>-day policy."
 
 4) P&ID context
    - For analysis / performance / trend / impact asks, ALWAYS retrieve P&ID context:
@@ -72,6 +76,8 @@ FOLLOW THESE RULES
 
    - State units if known; otherwise note that the data source does not specify units.
    - If no rows are returned, say “No rows for the given window” and suggest widening the window or adjusting tags.
+   - the exact time window used in UTC AND the actual aggregation bin (use tool_output.period)
+   - if any bin coercion occurred (see tool_output.bin_policy / tool_output.coercion_note), add a one-line note explaining it
 
 TOOL RECAP
 
