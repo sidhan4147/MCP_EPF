@@ -1,12 +1,11 @@
 import os
-
 import uuid
 import datetime
 from datetime import timezone, timedelta
 import logging
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+from attr import dataclass
 from dotenv import load_dotenv
 import pyodbc 
 from azure.kusto.data import (
@@ -15,7 +14,6 @@ from azure.kusto.data import (
     ClientRequestProperties,
 )
 from azure.kusto.data.response import KustoResponseDataSet
-
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from rapidfuzz import fuzz
@@ -35,7 +33,34 @@ def _dbg(msg: str):
     print(msg, flush=True)
     logger.info(msg)
 
+@dataclass(frozen=True)
+class TagRanges:
+    unit: str
+    min_val: float
+    max_val: float
+    hi_hi: float
+    hi: float
+    lo: float
+    lo_lo: float
 
+FIXED_TAGS_WITH_RANGES: Dict[str, TagRanges] = {
+    "400JTPIT4031/PV.CV": TagRanges("PSI",   0, 1600, 1500, 1200, 400, 950),
+    "400JTPIT4050/PV.CV": TagRanges("PSI",   0, 2000, 1100, 1040, 400, 200),
+    "400JTTIT4031/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
+    "400JTTIT4030/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
+    "400JTPIT4010/PV.CV": TagRanges("PSI",   0, 2000, 1300, 1200,1100,1080),
+    "400JTTIT4010/PV.CV": TagRanges("F",      0,  250,   95,   90,  10,   5),
+    "400JTTIT4012/PV.CV": TagRanges("F",      0,  250,  140,  120,  85,  70),
+    "400JTPIT4030/PV.CV": TagRanges("PSI",   0, 2000, 1090, 1076,1070,1060),
+    "400JTPIT4032/PV.CV": TagRanges("PSI",   0, 1600, 1500, 1200, 400, 300),
+    "400JTTIT4032/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
+    "400JTTIT4050/PV.CV": TagRanges("F",    -40,  250,  200,  150,  -5, -10),
+    "400JTPIT4011/PV.CV": TagRanges("PSI",   0, 2000, 1200,  945, 400, 300),
+    "400JTTIT4011/PV.CV": TagRanges("F",    -40,  250,  200,  150,  -5, -10),
+    "400FI401/PV.CV":     TagRanges("MMSCFD",0,  200,   200,  150,  -5, -10),
+    "400PIC010/PV.CV":    TagRanges("PSI",   0, 1300,  650,  558, 456, 250),
+}
+    
 KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
     os.environ["KUSTO_SERVICE_URI"],
     os.environ["AZURE_CLIENT_ID"],
@@ -408,6 +433,121 @@ def _build_tokens_for_fallback(tags: List[str]) -> List[str]:
             seen.add(x)
     return out
 
+def _meta_for_tag(tag: str) -> Dict[str, Any]:
+    """Return a dict with desc, unit, ranges for a tag."""
+    desc = FIXED_TAGS.get(tag)
+    rng = FIXED_TAGS_WITH_RANGES.get(tag)
+    return {
+        "tag": tag,
+        "desc": desc,
+        "unit": rng.unit if rng else None,
+        "ranges": {
+            "min": rng.min_val, "max": rng.max_val,
+            "hi_hi": rng.hi_hi, "hi": rng.hi,
+            "lo": rng.lo, "lo_lo": rng.lo_lo
+        } if rng else None
+    }
+
+def _classify_value(tag: str, val: Optional[Union[int, float]]) -> Dict[str, Any]:
+    """
+    Classify a single reading using TagRanges thresholds.
+    Returns {status, reason} where status in:
+      INVALID (outside sensor bounds), LO_LO, LO, OK, HI, HI_HI, UNKNOWN
+    """
+    if val is None:
+        return {"status": "UNKNOWN", "reason": "value is None"}
+    rng = FIXED_TAGS_WITH_RANGES.get(tag)
+    if not rng:
+        return {"status": "UNKNOWN", "reason": "no ranges for tag"}
+    try:
+        v = float(val)
+    except Exception:
+        return {"status": "UNKNOWN", "reason": "non-numeric"}
+
+    if v < rng.min_val or v > rng.max_val:
+        return {"status": "INVALID", "reason": f"outside sensor bounds [{rng.min_val},{rng.max_val}]"}
+    if v <= rng.lo_lo:
+        return {"status": "LO_LO", "reason": f"<= lo_lo ({rng.lo_lo})"}
+    if v <= rng.lo:
+        return {"status": "LO", "reason": f"<= lo ({rng.lo})"}
+    if v >= rng.hi_hi:
+        return {"status": "HI_HI", "reason": f">= hi_hi ({rng.hi_hi})"}
+    if v >= rng.hi:
+        return {"status": "HI", "reason": f">= hi ({rng.hi})"}
+    return {"status": "OK", "reason": f"within ({rng.lo},{rng.hi})"}
+
+def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compute min/max/avg, first/last, trend, status distribution,
+    threshold crossings, and anomalies list.
+    Expects rows with keys: Timestamp, TagName, Value (ascending time preferred).
+    """
+    import math
+    vals: List[float] = []
+    statuses: List[str] = []
+    anomalies: List[Dict[str, Any]] = []
+    crossings = 0
+
+    last_status = None
+    first_val = None
+    last_val = None
+
+    for r in rows:
+        v = r.get("Value")
+        cls = _classify_value(tag, v)
+        st = cls["status"]
+        statuses.append(st)
+
+        # collect anomalies
+        if st in ("INVALID", "LO_LO", "HI_HI"):
+            anomalies.append({
+                "timestamp": r.get("Timestamp"),
+                "value": v,
+                "status": st,
+                "reason": cls["reason"]
+            })
+
+        # status crossing count
+        if last_status is not None and st != last_status:
+            crossings += 1
+        last_status = st
+
+        # numeric tracking
+        try:
+            fv = float(v)
+            vals.append(fv)
+            if first_val is None:
+                first_val = fv
+            last_val = fv
+        except Exception:
+            pass
+
+    dist = {
+        "OK": statuses.count("OK"),
+        "LO": statuses.count("LO"),
+        "LO_LO": statuses.count("LO_LO"),
+        "HI": statuses.count("HI"),
+        "HI_HI": statuses.count("HI_HI"),
+        "INVALID": statuses.count("INVALID"),
+        "UNKNOWN": statuses.count("UNKNOWN"),
+        "total": len(statuses),
+    }
+
+    if vals:
+        vmin, vmax = min(vals), max(vals)
+        vavg = sum(vals) / len(vals)
+        trend = (last_val - first_val) if (first_val is not None and last_val is not None) else None
+    else:
+        vmin = vmax = vavg = trend = None
+
+    return {
+        "min": vmin, "max": vmax, "avg": vavg,
+        "first": first_val, "last": last_val, "trend": trend,
+        "status_distribution": dist,
+        "status_crossings": crossings,
+        "anomalies": anomalies
+    }
+
 @mcp.tool(description=f"Fetch raw rows from {ISP_TABLE} for the provided comma-separated tag list, with optional time window or limit. You can also pass relative='last 7 days' etc.")
 def isp_get_tags_data(
     tag_names: str,
@@ -599,7 +739,7 @@ def isp_stats(
 # Fixed tag tools
 @mcp.tool(description="List the fixed EPF JT tags (in-memory) with descriptions.")
 def fixed_tags_all() -> List[Dict[str, str]]:
-    out = [{"tag": t, "desc": d} for t, d in FIXED_TAGS.items()]
+    out = [{"tag": t, "desc": d, "unit": FIXED_TAGS_WITH_RANGES.get(t).unit if t in FIXED_TAGS_WITH_RANGES else None} for t, d in FIXED_TAGS.items()]
     _dbg(f"[fixed_tags_all] Count={len(out)}")
     return out
 
@@ -607,7 +747,7 @@ def fixed_tags_all() -> List[Dict[str, str]]:
 def fixed_tags_lookup(query: str) -> List[Dict[str, str]]:
     _dbg(f"[fixed_tags_lookup] query='{query}'")
     pairs = _fixed_search(query)
-    out = [{"tag": t, "desc": d} for t, d in pairs]
+    out = [{"tag": t, "desc": d, "unit": FIXED_TAGS_WITH_RANGES.get(t).unit if t in FIXED_TAGS_WITH_RANGES else None} for t, d in pairs]
     _dbg(f"[fixed_tags_lookup] Matches={len(out)}")
     return out
 
@@ -688,7 +828,7 @@ def context_values_by_query(
     _dbg(f"[context_values_by_query] values_rows={len(values)}")
 
     # In-memory descriptions & local P&ID context
-    inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
+    inmem = [_meta_for_tag(t) for t in tags]
     pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=period)
     # pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=None)
     
@@ -709,57 +849,111 @@ def context_values_by_query(
     }
     return out
 
-# Aggregate (defaults to hourly bins if not specified) + P&ID context
-# @mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
-# def isp_aggregate_for_query(
-#     query: Optional[str] = None,
-#     tag_names: Optional[str] = None,
-#     agg: str = "avg",
-#     period: Optional[str] = None,
-#     start_time: Optional[str] = None,
-#     end_time: Optional[str] = None,
-#     database: str = DB,
-#     relative: Optional[str] = None,     # NEW
-# ) -> Dict[str, Any]:
-#     _dbg(f"[isp_aggregate_for_query] query='{query}' tag_names='{tag_names}' agg={agg} period={period} start={start_time} end={end_time} DB={database} relative={relative}")
 
-#     if tag_names:
-#         tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
-#     else:
-#         tags = _resolve_tags_for_query(query or "", default_all_if_perf=True)
+@mcp.tool(description="Evaluate performance vs thresholds using FIXED_TAGS_WITH_RANGES. Resolves tags by query (all canonical tags for performance-style asks). Compares raw values to thresholds and summarizes min/max/avg, trend, status distribution, anomalies, P&ID and optional weather.")
+def isp_performance_for_query(
+    query: Optional[str] = None,
+    tag_names: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    relative: Optional[str] = None,
+    limit: Optional[int] = None,
+    database: str = DB,
+    with_weather: bool = False
+) -> Dict[str, Any]:
+    _dbg(f"[isp_performance_for_query] query='{query}' tag_names='{tag_names}' start={start_time} end={end_time} relative={relative} limit={limit} weather={with_weather}")
 
-#     _dbg(f"[isp_aggregate_for_query] tags_resolved={tags}")
-#     if not tags:
-#         return {"tags_resolved": [], "note": "No tags found to aggregate."}
+    # Resolve tags
+    if tag_names:
+        tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
+    else:
+        tags = _resolve_tags_for_query(query or "", default_all_if_perf=True)
 
-#     # Default resolution: hourly if not specified
-#     span = _normalize_period(period) or "1h"
+    if not tags:
+        return {"tags_resolved": [], "note": "No tags found to evaluate."}
 
-#     rows = isp_stats(
-#         tag_names=",".join(tags),
-#         agg=agg,
-#         period=span,
-#         start_time=start_time,
-#         end_time=end_time,
-#         database=database,
-#         relative=relative,
-#     )
+    # Fetch raw values (limit OR window/relative)
+    tags_csv = ",".join(tags)
+    if limit:
+        values = isp_get_tags_data(tag_names=tags_csv, limit=limit, database=database)
+        window_info = {"mode": f"latest {int(limit)}"}
+        # infer start/end from returned data if present
+        if values:
+            window_info["start_time"] = values[-1]["Timestamp"]
+            window_info["end_time"] = values[0]["Timestamp"]
+    else:
+        values = isp_get_tags_data(tag_names=tags_csv, start_time=start_time, end_time=end_time, relative=relative, database=database)
+        # Normalize/echo actual window used
+        now = datetime.datetime.now(timezone.utc)
+        try:
+            end_dt   = _parse_iso_dt(end_time, now)
+            start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
+            if relative:
+                win = _parse_relative_window(relative, now)
+                if win:
+                    start_dt, end_dt = win
+        except Exception:
+            end_dt = now
+            start_dt = end_dt - timedelta(minutes=15)
+        window_info = {
+            "start_time": _utc_str(start_dt),
+            "end_time": _utc_str(end_dt),
+            "relative": relative
+        }
 
-#     inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
-#     pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=span)
+    # Group rows by tag for per-tag analysis
+    by_tag: Dict[str, List[Dict[str, Any]]] = {}
+    for r in values:
+        t = r.get("TagName")
+        if t:
+            by_tag.setdefault(t, []).append(r)
 
-#     out: Dict[str, Any] = {
-#         "tags_resolved": tags,
-#         "aggregate": agg,
-#         "period": span,
-#         "results": rows,
-#         "time_window": {"start_time": start_time, "end_time": end_time, "relative": relative},
-#         "tag_context_in_memory": inmem,
-#         "pid_context": pid,
-#     }
+    # Ensure ascending by time for summaries
+    for t in by_tag:
+        by_tag[t].sort(key=lambda r: r.get("Timestamp"))
 
-#     _dbg(f"[isp_aggregate_for_query] results_rows={len(rows)}")
-#     return out
+    # Build per-tag evaluations
+    evaluations: Dict[str, Any] = {}
+    global_anomalies: List[Dict[str, Any]] = []
+
+    for t in tags:
+        series = by_tag.get(t, [])
+        summary = _summarize_series(t, series)
+        meta = _meta_for_tag(t)
+        evaluations[t] = {
+            "meta": meta,
+            "summary": summary
+        }
+        # collect anomalies with tag label
+        for a in summary["anomalies"]:
+            a2 = dict(a)
+            a2["tag"] = t
+            a2["unit"] = meta.get("unit")
+            global_anomalies.append(a2)
+
+    # P&ID context (use same period as window_info if available)
+    pid = pid_context(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), relative=window_info.get("relative"))
+
+    # Optional weather
+    weather = []
+    if with_weather:
+        try:
+            weather = plant_weather(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), agg="avg", period=None)
+        except Exception as e:
+            _dbg(f"[isp_performance_for_query] weather error: {e}")
+
+    out = {
+        "tags_resolved": tags,
+        "tag_context_in_memory": [_meta_for_tag(t) for t in tags],
+        "window": window_info,
+        "evaluations": evaluations,       # per-tag summaries & status distributions
+        "anomalies": global_anomalies,    # flat list across all tags
+        "pid_context": pid,
+        "weather": weather
+    }
+    _dbg(f"[isp_performance_for_query] tags={len(tags)} anomalies={len(global_anomalies)}")
+    return out
+
 @mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
 def isp_aggregate_for_query(
     query: Optional[str] = None,
@@ -829,7 +1023,7 @@ def isp_aggregate_for_query(
         relative=None,  # already resolved
     )
 
-    inmem = [{"tag": t, "desc": FIXED_TAGS.get(t)} for t in tags]
+    inmem = [_meta_for_tag(t) for t in tags]
     # IMPORTANT: keep weather independent -> do NOT pass the plant period here
     pid = pid_context(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), relative=None, period=None)
 
