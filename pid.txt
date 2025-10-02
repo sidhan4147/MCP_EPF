@@ -25,29 +25,6 @@ The EPF JT skid is designed to cool high-pressure natural gas so that valuable l
 -Troubleshooting: Use “if this, then that” logic—e.g., if the JT outlet temperature is too high, check upstream cooling and valve operation; if liquid carryover occurs, inspect separator and control valves.
 
 5.Tag Mapping
-### Tag Details Table
-
---------------------------------------------------------------------------------
-| Tag Name              | Description                                      | Unit   | Min | Max | Hi Hi | Hi | Low | Low Low | Component Reference                             | Actionable Guidance                                      |
-|-----------------------|--------------------------------------------------|--------|-----|-----|-------|----|-----|---------|--------------------------------------------------|----------------------------------------------------------|
-| 400PIC010/PV.CV       | EPF COMP SUCTION TO FLARE                        | PSI    | 0   |1300 | 650   |558 |456  | 250     | Compressor suction, downstream of V-405         | If >650 PSI: Flare bypass triggered; <250 PSI: flow issue|
-| 400JTPIT4031/PV.CV    | JT INLET EXCHANGER GAS PRESSURE (E-403A/B)       | PSI    | 0   |1600 |1500   |1200|400  | 950     | E-403A/B inlet (tube side), parallel branch     | >1500 PSI: Overpressure risk; <400 PSI: low feed pressure|
-| 400JTPIT4050/PV.CV    | JT COLD SEPARATOR PRESSURE                       | PSI    | 0   |2000 |1100   |1040|400  | 200     | Cold separator V-405, downstream of JT valve    | >1100 PSI: Overpressure; <200 PSI: separator issue       |
-| 400JTTIT4031/PV.CV    | JT INLET EXCHANGER GAS TEMPERATURE (E-403A/B)    | F      | -58 |392  | 95    | 90 | 10  | 5       | E-403A/B inlet (hot gas side)                   | >95°F: Insufficient cooling; <5°F: hydrate risk          |
-| 400JTTIT4030/PV.CV    | JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)   | F      | -58 |392  | 95    | 90 | 10  | 5       | E-403A/B outlet (cold gas side)                 | >95°F: Poor heat exchange; <5°F: hydrate risk            |
-| 400JTPIT4010/PV.CV    | JT SKID INLET PRESSURE                           | PSI    | 0   |2000 |1300   |1200|1100 |1080     | 10″ inlet gas line upstream of E-401/E-403      | >1300 PSI: High upstream pressure; <1080 PSI: feed issue |
-| 400JTTIT4010/PV.CV    | JT INLET GAS TEMPERATURE (E-401A/B/C)            | F      | 0   |250  | 95    | 90 | 10  | 5       | Upstream of E-401A/B/C                          | >95°F: Insufficient cooling; <5°F: hydrate risk          |
-| 400JTTIT4012/PV.CV    | CONDITIONED GAS TEMPERATURE                      | F      | 0   |250  |140    |120 | 85  | 70      | Downstream of E-401A/B/C, merging all streams   | >140°F: Poor cooling; <70°F: hydrate risk                |
-| 400JTPIT4030/PV.CV    | E-402 DISCHARGE PRESSURE                         | PSI    | 0   |2000 |1090   |1076|1070 |1060     | E-402 outlet, upstream of JT valve              | >1090 PSI: Outlet high; <1060 PSI: flow issue            |
-| 400JTPIT4032/PV.CV    | JT OUTLET EXCHANGER GAS PRESSURE (E-403A/B)      | PSI    | 0   |1600 |1500   |1200|400  | 300     | E-403A/B outlet (hot side)                      | >1500 PSI: Restriction; <300 PSI: leak/flow issue        |
-| 400JTTIT4032/PV.CV    | JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)   | F      | -58 |392  | 95    | 90 | 10  | 5       | E-403A/B outlet (after cooling)                 | >95°F: Poor cooling; <5°F: hydrate risk                  |
-| 400JTTIT4050/PV.CV    | JT COLD SEPARATOR TEMPERATURE                    | F      | -40 |250  |200    |150 | -5  | -10     | Cold separator V-405                            | >200°F: Too warm; <-10°F: hydrate risk                   |
-| 400JTPIT4011/PV.CV    | CONDITIONED GAS PRESSURE                         | PSI    | 0   |2000 |1200   |945 |400  | 300     | Upstream of JT valve (PCV-4050)                 | >1200 PSI: High pressure; <300 PSI: leak/flow issue      |
-| 400JTTIT4011/PV.CV    | E-401A/B/C OUTLET TEMPERATURE                    | F      | -40 |250  |200    |150 | -5  | -10     | E-401A/B/C outlet (after cooling)               | >200°F: Poor cooling; <-10°F: hydrate risk               |
-| 400FI401/PV.CV        | GAS TO EPF COLD EXCHANGER                        | MMSCFD | 0   |200  |200    |150 | -5  | -10     | JT skid exchanger system inlet                  | >200 MMSCFD: Overcapacity; <-10 MMSCFD: flow issue       |
-
-
-
 ### Explicit Mapping Table
 
 --------------------------------------------------------------------------------

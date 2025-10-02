@@ -34,31 +34,124 @@ def _dbg(msg: str):
     logger.info(msg)
 
 @dataclass(frozen=True)
-class TagRanges:
+class TagDetails:
+    description: str
     unit: str
     min_val: float
     max_val: float
     hi_hi: float
     hi: float
-    lo: float
-    lo_lo: float
+    low: float
+    low_low: float
+    component_reference: str
+    actionable_guidance: str
 
-FIXED_TAGS_WITH_RANGES: Dict[str, TagRanges] = {
-    "400JTPIT4031/PV.CV": TagRanges("PSI",   0, 1600, 1500, 1200, 400, 950),
-    "400JTPIT4050/PV.CV": TagRanges("PSI",   0, 2000, 1100, 1040, 400, 200),
-    "400JTTIT4031/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
-    "400JTTIT4030/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
-    "400JTPIT4010/PV.CV": TagRanges("PSI",   0, 2000, 1300, 1200,1100,1080),
-    "400JTTIT4010/PV.CV": TagRanges("F",      0,  250,   95,   90,  10,   5),
-    "400JTTIT4012/PV.CV": TagRanges("F",      0,  250,  140,  120,  85,  70),
-    "400JTPIT4030/PV.CV": TagRanges("PSI",   0, 2000, 1090, 1076,1070,1060),
-    "400JTPIT4032/PV.CV": TagRanges("PSI",   0, 1600, 1500, 1200, 400, 300),
-    "400JTTIT4032/PV.CV": TagRanges("F",    -58,  392,   95,   90,  10,   5),
-    "400JTTIT4050/PV.CV": TagRanges("F",    -40,  250,  200,  150,  -5, -10),
-    "400JTPIT4011/PV.CV": TagRanges("PSI",   0, 2000, 1200,  945, 400, 300),
-    "400JTTIT4011/PV.CV": TagRanges("F",    -40,  250,  200,  150,  -5, -10),
-    "400FI401/PV.CV":     TagRanges("MMSCFD",0,  200,   200,  150,  -5, -10),
-    "400PIC010/PV.CV":    TagRanges("PSI",   0, 1300,  650,  558, 456, 250),
+TAG_DETAILS: Dict[str, TagDetails] = {
+    "400PIC010/PV.CV": TagDetails(
+        description="EPF COMP SUCTION TO FLARE",
+        unit="PSI",
+        min_val=0, max_val=1300, hi_hi=650, hi=558, low=456, low_low=250,
+        component_reference="Compressor suction, downstream of V-405",
+        actionable_guidance="If >650 PSI: Flare bypass triggered; <250 PSI: flow issue"
+    ),
+    "400JTPIT4031/PV.CV": TagDetails(
+        description="JT INLET EXCHANGER GAS PRESSURE (E-403A/B)",
+        unit="PSI",
+        min_val=0, max_val=1600, hi_hi=1500, hi=1200, low=950, low_low=400,
+        component_reference="E-403A/B inlet (tube side), parallel branch",
+        actionable_guidance=">1500 PSI: Overpressure risk; <400 PSI: low feed pressure"
+    ),
+    "400JTPIT4050/PV.CV": TagDetails(
+        description="JT COLD SEPARATOR PRESSURE",
+        unit="PSI",
+        min_val=0, max_val=2000, hi_hi=1100, hi=1040, low=400, low_low=200,
+        component_reference="Cold separator V-405, downstream of JT valve",
+        actionable_guidance=">1100 PSI: Overpressure; <200 PSI: separator issue"
+    ),
+    "400JTTIT4031/PV.CV": TagDetails(
+        description="JT INLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+        unit="F",
+        min_val=-58, max_val=392, hi_hi=95, hi=90, low=10, low_low=5,
+        component_reference="E-403A/B inlet (hot gas side)",
+        actionable_guidance=">95°F: Insufficient cooling; <5°F: hydrate risk"
+    ),
+    "400JTTIT4030/PV.CV": TagDetails(
+        description="JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+        unit="F",
+        min_val=-58, max_val=392, hi_hi=95, hi=90, low=10, low_low=5,
+        component_reference="E-403A/B outlet (cold gas side)",
+        actionable_guidance=">95°F: Poor heat exchange; <5°F: hydrate risk"
+    ),
+    "400JTPIT4010/PV.CV": TagDetails(
+        description="JT SKID INLET PRESSURE",
+        unit="PSI",
+        min_val=0, max_val=2000, hi_hi=1300, hi=1200, low=1000, low_low=900,
+        component_reference="10″ inlet gas line upstream of E-401/E-403",
+        actionable_guidance=">1300 PSI: High upstream pressure; <1080 PSI: feed issue"
+    ),
+    "400JTTIT4010/PV.CV": TagDetails(
+        description="JT INLET GAS TEMPERATURE (E-401A/B/C)",
+        unit="F",
+        min_val=0, max_val=250, hi_hi=95, hi=90, low=10, low_low=5,
+        component_reference="Upstream of E-401A/B/C",
+        actionable_guidance=">95°F: Insufficient cooling; <5°F: hydrate risk"
+    ),
+    "400JTTIT4012/PV.CV": TagDetails(
+        description="CONDITIONED GAS TEMPERATURE",
+        unit="F",
+        min_val=0, max_val=250, hi_hi=140, hi=120, low=85, low_low=70,
+        component_reference="Downstream of E-401A/B/C, merging all streams",
+        actionable_guidance=">140°F: Poor cooling; <70°F: hydrate risk"
+    ),
+    "400JTPIT4030/PV.CV": TagDetails(
+        description="E-402 DISCHARGE PRESSURE",
+        unit="PSI",
+        min_val=0, max_val=2000, hi_hi=1090, hi=1076, low=1070, low_low=1060,
+        component_reference="E-402 outlet, upstream of JT valve",
+        actionable_guidance=">1090 PSI: Outlet high; <1060 PSI: flow issue"
+    ),
+    "400JTPIT4032/PV.CV": TagDetails(
+        description="JT OUTLET EXCHANGER GAS PRESSURE (E-403A/B)",
+        unit="PSI",
+        min_val=0, max_val=1600, hi_hi=1500, hi=1200, low=400, low_low=300,
+        component_reference="E-403A/B outlet (hot side)",
+        actionable_guidance=">1500 PSI: Restriction; <300 PSI: leak/flow issue"
+    ),
+    "400JTTIT4032/PV.CV": TagDetails(
+        description="JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
+        unit="F",
+        min_val=-58, max_val=392, hi_hi=95, hi=90, low=10, low_low=5,
+        component_reference="E-403A/B outlet (after cooling)",
+        actionable_guidance=">95°F: Poor cooling; <5°F: hydrate risk"
+    ),
+    "400JTTIT4050/PV.CV": TagDetails(
+        description="JT COLD SEPARATOR TEMPERATURE",
+        unit="F",
+        min_val=-40, max_val=250, hi_hi=200, hi=150, low=-5, low_low=-10,
+        component_reference="Cold separator V-405",
+        actionable_guidance=">200°F: Too warm; <-10°F: hydrate risk"
+    ),
+    "400JTPIT4011/PV.CV": TagDetails(
+        description="CONDITIONED GAS PRESSURE",
+        unit="PSI",
+        min_val=0, max_val=2000, hi_hi=1200, hi=945, low=400, low_low=300,
+        component_reference="Upstream of JT valve (PCV-4050)",
+        actionable_guidance=">1200 PSI: High pressure; <300 PSI: leak/flow issue"
+    ),
+    "400JTTIT4011/PV.CV": TagDetails(
+        description="E-401A/B/C OUTLET TEMPERATURE",
+        unit="F",
+        min_val=-40, max_val=250, hi_hi=200, hi=150, low=-5, low_low=-10,
+        component_reference="E-401A/B/C outlet (after cooling)",
+        actionable_guidance=">200°F: Poor cooling; <-10°F: hydrate risk"
+    ),
+    "400FI401/PV.CV": TagDetails(
+        description="GAS TO EPF COLD EXCHANGER",
+        unit="MMSCFD",
+        min_val=0, max_val=200, hi_hi=200, hi=150, low=-5, low_low=-10,
+        component_reference="JT skid exchanger system inlet",
+        actionable_guidance=">200 MMSCFD: Overcapacity; <-10 MMSCFD: flow issue"
+    ),
 }
     
 KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
@@ -281,36 +374,17 @@ def _coerce_min_bin_for_window(span: Optional[str],
             return min_span
     return span
 
-# Fixed EPF JT tag set (in-memory)
-FIXED_TAGS: Dict[str, str] = {
-    "400JTPIT4031/PV.CV": "EPF JT INLET EXCHANGER GAS PRESSURE (E-403A/B)",
-    "400JTPIT4050/PV.CV": "EPF JT COLD SEPARATOR PRESSURE",
-    "400JTTIT4031/PV.CV": "EPF JT INLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
-    "400JTTIT4030/PV.CV": "EPF JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
-    "400JTPIT4010/PV.CV": "EPF JT SKID INLET PRESSURE",
-    "400JTTIT4010/PV.CV": "EPF JT INLET GAS TEMPERATURE (E-401A/B/C)",
-    "400JTTIT4012/PV.CV": "EPF JT CONDITIONNED GAS TEMPERATURE",
-    "400JTPIT4030/PV.CV": "EPF JT E-402 DISCHARGE PRESSURE",
-    "400JTPIT4032/PV.CV": "EPF JT OUTLET EXCHANGER GAS PRESSURE (E-403A/B)",
-    "400JTTIT4032/PV.CV": "EPF JT OUTLET EXCHANGER GAS TEMPERATURE (E-403A/B)",
-    "400JTTIT4050/PV.CV": "EPF JT COLD SEPARATOR TEMPERATURE",
-    "400JTPIT4011/PV.CV": "EPF JT CONDITIONNED GAS PRESSURE",
-    "400JTTIT4011/PV.CV": "EPF JT E-401/A/B/C OUTLET TEMPERATURE",
-    "400FI401/PV.CV":     "GAS TO EPF COLD EXCHANGER",
-    "400PIC010/PV.CV":    "EPF COMP SUCTION TO FLARE",
-}
-
-def _fixed_search(query: str, threshold: int = 60) -> List[Tuple[str, str]]:
+def _fixed_search(query: str, threshold: int = 60) -> List[Tuple[str, str, int]]:
     q = (query or "").strip().lower()
     if not q:
         return []
     results: List[Tuple[str, str, int]] = []
-    for tag, desc in FIXED_TAGS.items():
-        score_desc = fuzz.partial_ratio(q, desc.lower())
+    for tag, details in TAG_DETAILS.items():
+        score_desc = fuzz.partial_ratio(q, details.description.lower())
         score_tag  = fuzz.partial_ratio(q, tag.lower())
         score = max(score_desc, score_tag)
         if score >= threshold:
-            results.append((tag, desc, score))
+            results.append((tag, details.description, score))
     results.sort(key=lambda x: x[2], reverse=True)
     hits = [(tag, desc) for tag, desc, _ in results]
     _dbg(f"[resolver] Query='{query}'  Threshold={threshold}  Matches={len(hits)}")
@@ -322,7 +396,7 @@ def _resolve_tags_for_query(query: str, default_all_if_perf: bool = True) -> Lis
     """If query is generic 'performance/analysis/trend/etc', return ALL tags; else fuzzy resolve."""
     q = (query or "").strip()
     if default_all_if_perf and PERF_WORDS.search(q):
-        tags = list(FIXED_TAGS.keys())
+        tags = list(TAG_DETAILS.keys())
         _dbg(f"[resolve_tags] Performance-style query detected -> ALL tags ({len(tags)})")
         return tags
     # try fuzzy matches first
@@ -333,7 +407,7 @@ def _resolve_tags_for_query(query: str, default_all_if_perf: bool = True) -> Lis
     if not tags and default_all_if_perf:
         # if vague short ask like "performance?" — return all
         if len(q.split()) <= 2:
-            tags = list(FIXED_TAGS.keys())
+            tags = list(TAG_DETAILS.keys())
             _dbg(f"[resolve_tags] Very vague query -> ALL tags ({len(tags)})")
     tags = sorted(set(tags))
     _dbg(f"[resolve_tags] Resolved={tags}")
@@ -376,9 +450,6 @@ def _load_pid_text() -> str:
         _PID_CACHE.update({"text": txt, "mtime": mtime, "path": str(path)})
         _dbg(f"[pid] Loaded pid.txt from {path} ({len(txt)} chars)")
     return _PID_CACHE["text"] or ""
-
-
-
 
 # Time tool (in case it is required by the mcp to get the current time with zone)
 @mcp.tool()
@@ -434,29 +505,31 @@ def _build_tokens_for_fallback(tags: List[str]) -> List[str]:
     return out
 
 def _meta_for_tag(tag: str) -> Dict[str, Any]:
-    """Return a dict with desc, unit, ranges for a tag."""
-    desc = FIXED_TAGS.get(tag)
-    rng = FIXED_TAGS_WITH_RANGES.get(tag)
+    details = TAG_DETAILS.get(tag)
+    if not details:
+        return {"tag": tag, "desc": None}
     return {
         "tag": tag,
-        "desc": desc,
-        "unit": rng.unit if rng else None,
+        "desc": details.description,
+        "unit": details.unit,
         "ranges": {
-            "min": rng.min_val, "max": rng.max_val,
-            "hi_hi": rng.hi_hi, "hi": rng.hi,
-            "lo": rng.lo, "lo_lo": rng.lo_lo
-        } if rng else None
+            "min": details.min_val, "max": details.max_val,
+            "hi_hi": details.hi_hi, "hi": details.hi,
+            "low": details.low, "low_low": details.low_low
+        },
+        "component_reference": details.component_reference,
+        "actionable_guidance": details.actionable_guidance
     }
 
 def _classify_value(tag: str, val: Optional[Union[int, float]]) -> Dict[str, Any]:
     """
     Classify a single reading using TagRanges thresholds.
     Returns {status, reason} where status in:
-      INVALID (outside sensor bounds), LO_LO, LO, OK, HI, HI_HI, UNKNOWN
+      INVALID (outside sensor bounds), LOW_LOW, LOW, OK, HI, HI_HI, UNKNOWN
     """
     if val is None:
         return {"status": "UNKNOWN", "reason": "value is None"}
-    rng = FIXED_TAGS_WITH_RANGES.get(tag)
+    rng = TAG_DETAILS.get(tag)
     if not rng:
         return {"status": "UNKNOWN", "reason": "no ranges for tag"}
     try:
@@ -466,15 +539,15 @@ def _classify_value(tag: str, val: Optional[Union[int, float]]) -> Dict[str, Any
 
     if v < rng.min_val or v > rng.max_val:
         return {"status": "INVALID", "reason": f"outside sensor bounds [{rng.min_val},{rng.max_val}]"}
-    if v <= rng.lo_lo:
-        return {"status": "LO_LO", "reason": f"<= lo_lo ({rng.lo_lo})"}
-    if v <= rng.lo:
-        return {"status": "LO", "reason": f"<= lo ({rng.lo})"}
+    if v <= rng.low_low:
+        return {"status": "LOW_LOW", "reason": f"<= low_low ({rng.low_low})"}
+    if v <= rng.low:
+        return {"status": "LOW", "reason": f"<= low ({rng.low})"}
     if v >= rng.hi_hi:
         return {"status": "HI_HI", "reason": f">= hi_hi ({rng.hi_hi})"}
     if v >= rng.hi:
         return {"status": "HI", "reason": f">= hi ({rng.hi})"}
-    return {"status": "OK", "reason": f"within ({rng.lo},{rng.hi})"}
+    return {"status": "OK", "reason": f"within ({rng.low},{rng.hi})"}
 
 def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -499,7 +572,7 @@ def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         statuses.append(st)
 
         # collect anomalies
-        if st in ("INVALID", "LO_LO", "HI_HI"):
+        if st in ("INVALID", "LOW_LOW", "LOW", "HI", "HI_HI"):
             anomalies.append({
                 "timestamp": r.get("Timestamp"),
                 "value": v,
@@ -524,8 +597,8 @@ def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     dist = {
         "OK": statuses.count("OK"),
-        "LO": statuses.count("LO"),
-        "LO_LO": statuses.count("LO_LO"),
+        "LOW": statuses.count("LOW"),
+        "LOW_LOW": statuses.count("LOW_LOW"),
         "HI": statuses.count("HI"),
         "HI_HI": statuses.count("HI_HI"),
         "INVALID": statuses.count("INVALID"),
@@ -737,17 +810,30 @@ def isp_stats(
 
 
 # Fixed tag tools
-@mcp.tool(description="List the fixed EPF JT tags (in-memory) with descriptions.")
-def fixed_tags_all() -> List[Dict[str, str]]:
-    out = [{"tag": t, "desc": d, "unit": FIXED_TAGS_WITH_RANGES.get(t).unit if t in FIXED_TAGS_WITH_RANGES else None} for t, d in FIXED_TAGS.items()]
-    _dbg(f"[fixed_tags_all] Count={len(out)}")
-    return out
+@mcp.tool(description="List all EPF JT tags with full metadata.")
+def fixed_tags_all() -> List:
+    return [
+            {
+                "tag": tag,
+                "desc": details.description,
+                "unit": details.unit,
+                "ranges": {
+                    "min": details.min_val, "max": details.max_val,
+                    "hi_hi": details.hi_hi, "hi": details.hi,
+                    "lo": details.low, "lo_lo": details.low_low
+                },
+                "component_reference": details.component_reference,
+                "actionable_guidance": details.actionable_guidance
+            }
+            for tag, details in TAG_DETAILS.items()
+        ]
+
 
 @mcp.tool(description="Look up the fixed EPF JT tags by tag/prefix or by keywords like 'temperature' or 'pressure'. Returns matching tags with descriptions.")
 def fixed_tags_lookup(query: str) -> List[Dict[str, str]]:
     _dbg(f"[fixed_tags_lookup] query='{query}'")
     pairs = _fixed_search(query)
-    out = [{"tag": t, "desc": d, "unit": FIXED_TAGS_WITH_RANGES.get(t).unit if t in FIXED_TAGS_WITH_RANGES else None} for t, d in pairs]
+    out = [{"tag": t, "desc": d, "unit": TAG_DETAILS.get(t).unit if t in TAG_DETAILS else None} for t, d in pairs]
     _dbg(f"[fixed_tags_lookup] Matches={len(out)}")
     return out
 
@@ -757,8 +843,8 @@ def fixed_tag_describe(tag_name: str) -> Dict[str, Any]:
     _dbg(f"[fixed_tag_describe] tag_name='{tag}'")
     if not tag:
         return {"error": "tag_name is required"}
-    if tag in FIXED_TAGS:
-        out = {"tag": tag, "desc": FIXED_TAGS[tag], "source": "fixed"}
+    if tag in TAG_DETAILS:
+        out = {"tag": tag, "desc": TAG_DETAILS[tag].description, "source": "fixed"}
         _dbg(f"[fixed_tag_describe] HIT fixed -> {out}")
         return out
     _dbg("[fixed_tag_describe] NOT FOUND")
@@ -850,7 +936,7 @@ def context_values_by_query(
     return out
 
 
-@mcp.tool(description="Evaluate performance vs thresholds using FIXED_TAGS_WITH_RANGES. Resolves tags by query (all canonical tags for performance-style asks). Compares raw values to thresholds and summarizes min/max/avg, trend, status distribution, anomalies, P&ID and optional weather.")
+@mcp.tool(description="Evaluate performance vs thresholds using TAG_DETAILS. Resolves tags by query (all canonical tags for performance-style asks). Compares raw values to thresholds and summarizes min/max/avg, trend, status distribution, anomalies, P&ID and optional weather.")
 def isp_performance_for_query(
     query: Optional[str] = None,
     tag_names: Optional[str] = None,
