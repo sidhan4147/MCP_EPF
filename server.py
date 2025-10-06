@@ -418,8 +418,8 @@ def _get_weather_for_window(
     relative: Optional[str],
     period: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    # If user didn't specify period, default to 30m
-    bin_period = period or "30m"
+    # If user didn't specify period, default to 1h
+    bin_period = period or "1h"
     return plant_weather(
         start_time=start_time,
         end_time=end_time,
@@ -1024,7 +1024,7 @@ def isp_performance_for_query(
     weather = []
     if with_weather:
         try:
-            weather = plant_weather(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), agg="avg", period=None)
+            weather = plant_weather(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), agg="avg", period="1h")
         except Exception as e:
             _dbg(f"[isp_performance_for_query] weather error: {e}")
 
@@ -1193,7 +1193,7 @@ def plant_weather(
             kql = (
                 "KM400WeatherDataTBL "
                 f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
-                f"| summarize {agg_exprs} by bin(Timestamp, {span}) "
+                f"| summarize {agg_exprs} by bin(Timestamp, 1h) "
                 "| order by Timestamp asc"
             )
         else:
