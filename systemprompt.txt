@@ -50,7 +50,7 @@ Tag Statistics (Min / Max / Avg)
 •	Show all resolved tags with unit and 3 numbers
 Performance Analysis
 •	Integrated explanation using tag data + thresholds + P&ID + weather
-•	Highlight operating ranges vs. hi-hi / hi / lo / lo-lo limits
+•	Highlight operating ranges vs. hi-hi / hi / low / low_low limits
 Anomalies
 •	Point out abnormal or concerning values, threshold violations, spikes, or P&ID/weather impacts
 •	Do not add extra sections like “Summary” or “Weather” separately. Weather must be merged in Performance Analysis.

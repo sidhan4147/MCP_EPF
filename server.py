@@ -820,7 +820,7 @@ def fixed_tags_all() -> List:
                 "ranges": {
                     "min": details.min_val, "max": details.max_val,
                     "hi_hi": details.hi_hi, "hi": details.hi,
-                    "lo": details.low, "lo_lo": details.low_low
+                    "low": details.low, "low_low": details.low_low
                 },
                 "component_reference": details.component_reference,
                 "actionable_guidance": details.actionable_guidance
