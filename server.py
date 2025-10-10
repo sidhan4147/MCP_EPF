@@ -24,15 +24,20 @@ from fastapi.middleware.cors import CORSMiddleware
 import re
 from pathlib import Path
 
+# ==========================
+# Boot & logging
+# ==========================
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-server")
 
 def _dbg(msg: str):
-    """Mirror logs to stdout for easy n8n/Azure log viewing."""
     print(msg, flush=True)
     logger.info(msg)
 
+# ==========================
+# Tag metadata
+# ==========================
 @dataclass(frozen=True)
 class TagDetails:
     description: str
@@ -153,7 +158,10 @@ TAG_DETAILS: Dict[str, TagDetails] = {
         actionable_guidance=">200 MMSCFD: Overcapacity; <-10 MMSCFD: flow issue"
     ),
 }
-    
+
+# ==========================
+# Kusto clients
+# ==========================
 KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
     os.environ["KUSTO_SERVICE_URI"],
     os.environ["AZURE_CLIENT_ID"],
@@ -163,12 +171,10 @@ KCSB = KustoConnectionStringBuilder.with_aad_application_key_authentication(
 kusto = KustoClient(KCSB)
 DB = os.environ.get("KUSTO_DATABASE", "")
 
-# ISPPLANTDATA schema so the tool list_table_schema is not required 
 ISP_TABLE   = "ISPPLANTDATA"
 ISP_TAG_COL = "TagName"
 ISP_VAL_COL = "Value"
 ISP_TS_COL  = "Timestamp"
-
 
 WEATHER_SERVICE_URI = os.environ.get("KUSTO_WEATHER_SERVICE_URI", "")
 if not WEATHER_SERVICE_URI:
@@ -189,9 +195,14 @@ if not WEATHER_DB:
     _dbg("ERROR: Missing weather database name (set WEATHER_DB).")
     raise ValueError("Missing Kusto weather database name.")
 
-
+# ==========================
+# MCP wiring
+# ==========================
 mcp = FastMCP(name="fabric-eventhouse-mcp", description="MCP server for Fabric Eventhouse tools")
 
+# ==========================
+# Helpers
+# ==========================
 
 def format_results(result_set: Optional[KustoResponseDataSet]) -> List[Dict[str, Any]]:
     if not result_set or not getattr(result_set, "primary_results", None):
@@ -199,6 +210,7 @@ def format_results(result_set: Optional[KustoResponseDataSet]) -> List[Dict[str,
     first = result_set.primary_results[0]
     cols = [col.column_name for col in first.columns]
     return [dict(zip(cols, row)) for row in first.rows]
+
 
 def execute_kusto(query: str, client: KustoClient, database: str, readonly: bool = True) -> List[Dict[str, Any]]:
     crp = ClientRequestProperties()
@@ -217,6 +229,7 @@ def execute_kusto(query: str, client: KustoClient, database: str, readonly: bool
         _dbg(f"[execute_kusto] ERROR: {e}")
         raise
 
+
 def _sql_conn():
     driver = '{ODBC Driver 17 for SQL Server}'
     server = os.getenv("SQL_SERVER_HOST", "")
@@ -232,6 +245,7 @@ def _sql_conn():
     )
     return pyodbc.connect(conn_str)
 
+
 def _parse_iso_dt(s: Optional[str], default_dt: datetime.datetime) -> datetime.datetime:
     if not s:
         return default_dt
@@ -246,8 +260,10 @@ def _parse_iso_dt(s: Optional[str], default_dt: datetime.datetime) -> datetime.d
     except Exception as e:
         raise ValueError(f"Invalid ISO time '{s}': {e}")
 
+
 def _utc_str(dt: datetime.datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def _escape_sql_literal(s: str) -> str:
     return s.replace("'", "''")
@@ -256,11 +272,8 @@ _escape_kql_literal = _escape_sql_literal
 
 PERF_WORDS = re.compile(r"\b(analy[sz]e|analysis|evaluate|evaluation|trend|trends|impact|performance|health|efficien|stability|overview)\b", re.I)
 
+
 def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datetime] = None) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
-    """
-      'last 7 days', 'last 1 week', 'past 24 hours', '7d', '24h', '1w', 'last week'
-    Returns (start_dt_utc, end_dt_utc) or None if not parsed.
-    """
     if not relative:
         return None
     text = relative.strip().lower()
@@ -270,7 +283,6 @@ def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datet
         now = datetime.datetime.now(timezone.utc)
     end_dt = now
 
-    # direct forms: 7d, 24h, 1w
     m = re.fullmatch(r"(\d+)\s*([dhw])", text)
     if m:
         n = int(m.group(1))
@@ -282,7 +294,6 @@ def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datet
         if unit == "w":
             return (end_dt - timedelta(days=7*n), end_dt)
 
-    # phrases: last/past N days/weeks/hours
     m = re.search(r"(last|past)\s+(\d+)\s*(day|days|d|week|weeks|w|hour|hours|h)", text)
     if m:
         n = int(m.group(2))
@@ -297,24 +308,18 @@ def _parse_relative_window(relative: Optional[str], now: Optional[datetime.datet
     if m:
         n = int(m.group(2))
         return (end_dt - timedelta(days=30*n), end_dt)
-    # "last week" -> 7 days
+
     if text in ("last week", "past week"):
         return (end_dt - timedelta(days=7), end_dt)
-
-    # "last 24 hours"
     if text in ("last 24 hours", "past 24 hours"):
         return (end_dt - timedelta(hours=24), end_dt)
-    # "last month" -> 30 days
     if text in ("last month", "past month"):
         return (end_dt - timedelta(days=30), end_dt)
 
     return None
 
+
 def _normalize_period(period: Optional[str]) -> Optional[str]:
-    """
-    Normalize human-friendly period to Kusto timespan literal.
-    Returns None if not set.
-    """
     if not period:
         return None
     t = str(period).strip().lower()
@@ -324,25 +329,27 @@ def _normalize_period(period: Optional[str]) -> Optional[str]:
     if t in ("week", "weekly", "per week"):  return "7d"
     if t in ("month", "monthly", "per month"):  return "30d"
 
-    # 1w -> 7d
     m = re.fullmatch(r"(\d+)\s*w", t)
     if m:
         return f"{int(m.group(1)) * 7}d"
 
-    # Accept raw Kusto-like spans: 1h, 2h, 1d, 3d, 12h, etc.
     if re.fullmatch(r"\d+\s*[smhd]", t):
         return t.replace(" ", "")
 
-    return t  # pass-through (let Kusto complain if invalid)
+    return t
 
+# Smart bin policy
 LONG_WINDOW_THRESHOLD_DAYS = 15
 MIN_BIN_FOR_LONG_WINDOWS = "6h"
 
+SMART_BIN_RULES = [
+    (7, "1h"),
+    (15, "3h"),
+    (10**9, "6h"),  # >15d
+]
+
+
 def _span_to_timedelta(span: Optional[str]) -> Optional[datetime.timedelta]:
-    """
-    Convert a Kusto-like timespan string ('30m','1h','12h','1d','7d') to timedelta.
-    Returns None if span is None or unparseable.
-    """
     if not span:
         return None
     s = span.strip().lower()
@@ -357,22 +364,26 @@ def _span_to_timedelta(span: Optional[str]) -> Optional[datetime.timedelta]:
     if unit == "d": return datetime.timedelta(days=n)
     return None
 
-def _coerce_min_bin_for_window(span: Optional[str],
-                               start_dt: datetime.datetime,
-                               end_dt: datetime.datetime,
-                               threshold_days: int = LONG_WINDOW_THRESHOLD_DAYS,
-                               min_span: str = MIN_BIN_FOR_LONG_WINDOWS) -> Optional[str]:
-    """
-    If window length > threshold_days and span < min_span (or missing), coerce to min_span.
-    Applied ONLY to ISPPLANTDATA.
-    """
-    window_len = end_dt - start_dt
-    if window_len > datetime.timedelta(days=threshold_days):
-        min_td = _span_to_timedelta(min_span)
-        curr_td = _span_to_timedelta(span)
-        if curr_td is None or (min_td is not None and curr_td < min_td):
-            return min_span
-    return span
+
+def _choose_smart_bin(start_dt: datetime.datetime, end_dt: datetime.datetime, requested: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    days = (end_dt - start_dt).total_seconds() / 86400.0
+    if requested:
+        # Respect explicit period but enforce minimum for very long windows
+        td_req = _span_to_timedelta(_normalize_period(requested))
+        td_min = _span_to_timedelta(MIN_BIN_FOR_LONG_WINDOWS)
+        if days > LONG_WINDOW_THRESHOLD_DAYS and (td_req is None or (td_min and td_req < td_min)):
+            return MIN_BIN_FOR_LONG_WINDOWS, {
+                "requested": requested, "used": MIN_BIN_FOR_LONG_WINDOWS, "window_days": days, "coerced": True
+            }
+        return _normalize_period(requested) or "1h", {
+            "requested": requested, "used": _normalize_period(requested) or "1h", "window_days": days, "coerced": False
+        }
+    # choose from rules
+    for max_days, span in SMART_BIN_RULES:
+        if days <= max_days:
+            return span, {"requested": None, "used": span, "window_days": days, "coerced": False}
+    return "1h", {"requested": None, "used": "1h", "window_days": days, "coerced": False}
+
 
 def _fixed_search(query: str, threshold: int = 60) -> List[Tuple[str, str, int]]:
     q = (query or "").strip().lower()
@@ -392,33 +403,35 @@ def _fixed_search(query: str, threshold: int = 60) -> List[Tuple[str, str, int]]
         _dbg(f"[resolver]  -> {t} :: {d}")
     return hits
 
+
 def _resolve_tags_for_query(query: str, default_all_if_perf: bool = True) -> List[str]:
-    """If query is generic 'performance/analysis/trend/etc', return ALL tags; else fuzzy resolve."""
     q = (query or "").strip()
     if default_all_if_perf and PERF_WORDS.search(q):
         tags = list(TAG_DETAILS.keys())
         _dbg(f"[resolve_tags] Performance-style query detected -> ALL tags ({len(tags)})")
         return tags
-    # try fuzzy matches first
     pairs = _fixed_search(q)
     tags = [t for t, _ in pairs]
     if not tags and "/" in q:
-        tags = [q]  
+        tags = [q]
     if not tags and default_all_if_perf:
-        # if vague short ask like "performance?" — return all
         if len(q.split()) <= 2:
             tags = list(TAG_DETAILS.keys())
             _dbg(f"[resolve_tags] Very vague query -> ALL tags ({len(tags)})")
     tags = sorted(set(tags))
     _dbg(f"[resolve_tags] Resolved={tags}")
     return tags
+
+# ==========================
+# Weather helper
+# ==========================
+
 def _get_weather_for_window(
     start_time: Optional[str], 
     end_time: Optional[str], 
     relative: Optional[str],
     period: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    # If user didn't specify period, default to 1h
     bin_period = period or "1h"
     return plant_weather(
         start_time=start_time,
@@ -428,8 +441,9 @@ def _get_weather_for_window(
         weather_database=WEATHER_DB
     )
 
-
+# ==========================
 # pid.txt context loader
+# ==========================
 _PID_CACHE: Dict[str, Any] = {"text": None, "mtime": None, "path": None}
 
 def _load_pid_text() -> str:
@@ -451,7 +465,10 @@ def _load_pid_text() -> str:
         _dbg(f"[pid] Loaded pid.txt from {path} ({len(txt)} chars)")
     return _PID_CACHE["text"] or ""
 
-# Time tool (in case it is required by the mcp to get the current time with zone)
+# ==========================
+# Tools
+# ==========================
+
 @mcp.tool()
 def TimeTool(input_timezone: Optional[str] = None) -> str:
     fmt = "%Y-%m-%d %H:%M:%S %Z%z"
@@ -467,15 +484,13 @@ def TimeTool(input_timezone: Optional[str] = None) -> str:
     return out
 
 
-# Generic Kusto query (read-only)
 @mcp.tool(description="Run a read-only KQL query on the specified database ISPPLANTDATA and return the results.")
 def kusto_query(query: str, database: str = DB) -> List[Dict[str, Any]]:
     _dbg(f"[kusto_query] DB={database}")
     return execute_kusto(query=query, client=kusto, database=database)
 
 
-# ISPPLANTDATA tools (with relative window + fallback)
-@mcp.tool(description=f"Return the full JSON schema for the {ISP_TABLE} table in the database.")
+@mcp.tool(description=f"Return the full JSON schema for the ISPPLANTDATA table in the database.")
 def isp_table_schema(database: str = DB) -> str:
     rows = execute_kusto(
         query=f".show table {ISP_TABLE} cslschema",
@@ -484,6 +499,7 @@ def isp_table_schema(database: str = DB) -> str:
     )
     _dbg(f"[isp_table_schema] Schema rows={len(rows)}")
     return rows[0]["Schema"] if rows else ""
+
 
 def _build_tokens_for_fallback(tags: List[str]) -> List[str]:
     tokens: List[str] = []
@@ -504,6 +520,7 @@ def _build_tokens_for_fallback(tags: List[str]) -> List[str]:
             seen.add(x)
     return out
 
+
 def _meta_for_tag(tag: str) -> Dict[str, Any]:
     details = TAG_DETAILS.get(tag)
     if not details:
@@ -521,12 +538,8 @@ def _meta_for_tag(tag: str) -> Dict[str, Any]:
         "actionable_guidance": details.actionable_guidance
     }
 
+
 def _classify_value(tag: str, val: Optional[Union[int, float]]) -> Dict[str, Any]:
-    """
-    Classify a single reading using TagRanges thresholds.
-    Returns {status, reason} where status in:
-      INVALID (outside sensor bounds), LOW_LOW, LOW, OK, HI, HI_HI, UNKNOWN
-    """
     if val is None:
         return {"status": "UNKNOWN", "reason": "value is None"}
     rng = TAG_DETAILS.get(tag)
@@ -549,12 +562,8 @@ def _classify_value(tag: str, val: Optional[Union[int, float]]) -> Dict[str, Any
         return {"status": "HI", "reason": f">= hi ({rng.hi})"}
     return {"status": "OK", "reason": f"within ({rng.low},{rng.hi})"}
 
+
 def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Compute min/max/avg, first/last, trend, status distribution,
-    threshold crossings, and anomalies list.
-    Expects rows with keys: Timestamp, TagName, Value (ascending time preferred).
-    """
     import math
     vals: List[float] = []
     statuses: List[str] = []
@@ -571,7 +580,6 @@ def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         st = cls["status"]
         statuses.append(st)
 
-        # collect anomalies
         if st in ("INVALID", "LOW_LOW", "LOW", "HI", "HI_HI"):
             anomalies.append({
                 "timestamp": r.get("Timestamp"),
@@ -580,12 +588,10 @@ def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "reason": cls["reason"]
             })
 
-        # status crossing count
         if last_status is not None and st != last_status:
             crossings += 1
         last_status = st
 
-        # numeric tracking
         try:
             fv = float(v)
             vals.append(fv)
@@ -621,107 +627,10 @@ def _summarize_series(tag: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "anomalies": anomalies
     }
 
-@mcp.tool(description=f"Fetch raw rows from {ISP_TABLE} for the provided comma-separated tag list, with optional time window or limit. You can also pass relative='last 7 days' etc.")
-def isp_get_tags_data(
-    tag_names: str,
-    start_time: Optional[str] = None,
-    end_time:   Optional[str] = None,
-    limit:      Optional[int] = None,
-    database:   str = DB,
-    relative:   Optional[str] = None,   # NEW
-) -> List[Dict[str, Any]]:
-    tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
-    _dbg(f"[isp_get_tags_data] Input tags={tags}  limit={limit}  DB={database}  relative={relative}")
-    if not tags:
-        return []
-
-    tags_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tags) + "]"
-
-    now = datetime.datetime.now(timezone.utc)
-
-    # Relative window takes precedence if provided
-    if relative:
-        win = _parse_relative_window(relative, now)
-        if win:
-            start_time = _utc_str(win[0])
-            end_time   = _utc_str(win[1])
-            _dbg(f"[isp_get_tags_data] Parsed relative='{relative}' -> {start_time} .. {end_time}")
-
-    if limit:
-        kql = (
-            f"{ISP_TABLE} "
-            f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
-            f"| sort by {ISP_TS_COL} desc "
-            f"| take {int(limit)} "
-            f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL}"
-        )
-        rows = execute_kusto(query=kql, client=kusto, database=database)
-        if len(rows) == 0:
-            _dbg("[isp_get_tags_data] No rows (exact IN). Trying fallback: has_any/contains with tokens...")
-            tokens = _build_tokens_for_fallback(tags)
-            tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
-            kql_fb = (
-                f"{ISP_TABLE} "
-                f"| sort by {ISP_TS_COL} desc "
-                f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
-                f"| take {int(limit)} "
-                f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL}"
-            )
-            rows = execute_kusto(query=kql_fb, client=kusto, database=database)
-        _dbg(f"[isp_get_tags_data] Rows returned={len(rows)}")
-        return rows
-
-    try:
-        end_dt   = _parse_iso_dt(end_time, now)
-        start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
-    except ValueError as e:
-        _dbg(f"[isp_get_tags_data] Time parsing error: {e}")
-        return [{"error": str(e)}]
-
-    if start_dt > end_dt:
-        _dbg("[isp_get_tags_data] start_dt > end_dt; swapping.")
-        start_dt, end_dt = end_dt, start_dt
-
-    start_str = _utc_str(start_dt)
-    end_str   = _utc_str(end_dt)
-    _dbg(f"[isp_get_tags_data] Window UTC: {start_str} .. {end_str}")
-
-    kql = (
-        f"{ISP_TABLE} "
-        f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
-        f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
-        f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
-        f"| order by {ISP_TS_COL} asc"
-    )
-    rows = execute_kusto(query=kql, client=kusto, database=database)
-    if len(rows) == 0:
-        _dbg("[isp_get_tags_data] No rows (exact IN). Trying fallback: has_any/contains with tokens...")
-        tokens = _build_tokens_for_fallback(tags)
-        tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
-        kql_fb = (
-            f"{ISP_TABLE} "
-            f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
-            f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
-            f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
-            f"| order by {ISP_TS_COL} asc"
-        )
-        rows = execute_kusto(query=kql_fb, client=kusto, database=database)
-
-        if len(rows) == 0:
-            ors = " or ".join(f'{ISP_TAG_COL} contains "{_escape_kql_literal(t)}"' for t in tokens)
-            kql_fb2 = (
-                f"{ISP_TABLE} "
-                f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
-                f"| where {ors} "
-                f"| project {ISP_TS_COL}, {ISP_TAG_COL}, {ISP_VAL_COL} "
-                f"| order by {ISP_TS_COL} asc"
-            )
-            rows = execute_kusto(query=kql_fb2, client=kusto, database=database)
-
-    _dbg(f"[isp_get_tags_data] Rows returned={len(rows)}")
-    return rows
-
-@mcp.tool(description=f"Summarize {ISP_TABLE} over time for tags. Supports agg in (avg,min,max,sum,count) and optional bin period like 1h/1d. You can pass relative='last 7 days' etc.")
+# ==========================
+# Aggregations (Kusto summarize)
+# ==========================
+@mcp.tool(description=f"Summarize ISPPLANTDATA over time for tags. Supports agg in (avg,min,max,sum,count) and optional bin period like 1h/1d. You can pass relative='last 7 days' etc.")
 def isp_stats(
     tag_names: str,
     agg: str = "avg",
@@ -729,7 +638,7 @@ def isp_stats(
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     database: str = DB,
-    relative: Optional[str] = None,   # NEW
+    relative: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     tags = [t.strip() for t in (tag_names or "").split(",") if t.strip()]
     _dbg(f"[isp_stats] tags={tags} agg={agg} period={period} DB={database} relative={relative}")
@@ -741,7 +650,6 @@ def isp_stats(
         return [{"error": f"Unsupported agg '{agg}'. Use avg,min,max,sum,count."}]
 
     now = datetime.datetime.now(timezone.utc)
-
     if relative:
         win = _parse_relative_window(relative, now)
         if win:
@@ -762,18 +670,18 @@ def isp_stats(
     end_str   = _utc_str(end_dt)
     _dbg(f"[isp_stats] Window UTC: {start_str} .. {end_str}")
 
-    span = _normalize_period(period)
-    span_before = span
-    span = _coerce_min_bin_for_window(span, start_dt, end_dt)  # NEw (ISPPLANTDATA only)not weather
-    _dbg(f"[isp_stats] Bin policy: requested={span_before!r} -> used={span!r}; window_days={(end_dt-start_dt).total_seconds()/86400:.2f}")
+    # Choose / enforce bin
+    chosen_span, bin_meta = _choose_smart_bin(start_dt, end_dt, period)
+    _dbg(f"[isp_stats] Bin policy: requested={bin_meta['requested']!r} -> used={chosen_span!r}; window_days={bin_meta['window_days']:.2f}")
+
     tags_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tags) + "]"
 
-    if span:
+    if chosen_span:
         kql = (
             f"{ISP_TABLE} "
             f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
             f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
-            f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {span}) "
+            f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {chosen_span}) "
             f"| order by {ISP_TS_COL} asc"
         )
     else:
@@ -783,17 +691,19 @@ def isp_stats(
             f"| where {ISP_TAG_COL} in (dynamic({tags_array})) "
             f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}"
         )
+
     rows = execute_kusto(query=kql, client=kusto, database=database)
+
     if len(rows) == 0:
         _dbg("[isp_stats] No rows with exact IN. Trying fallback has_any...")
         tokens = _build_tokens_for_fallback(tags)
         tokens_array = "[" + ",".join(f"'{_escape_kql_literal(t)}'" for t in tokens) + "]"
-        if span:
+        if chosen_span:
             kql_fb = (
                 f"{ISP_TABLE} "
                 f"| where {ISP_TS_COL} between (datetime({start_str})..datetime({end_str})) "
                 f"| where {ISP_TAG_COL} has_any (dynamic({tokens_array})) "
-                f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {span}) "
+                f"| summarize {agg_l}_val = {agg_l}({ISP_VAL_COL}) by {ISP_TAG_COL}, bin({ISP_TS_COL}, {chosen_span}) "
                 f"| order by {ISP_TS_COL} asc"
             )
         else:
@@ -808,25 +718,26 @@ def isp_stats(
     _dbg(f"[isp_stats] Rows returned={len(rows)}")
     return rows
 
-
+# ==========================
 # Fixed tag tools
+# ==========================
 @mcp.tool(description="List all EPF JT tags with full metadata.")
 def fixed_tags_all() -> List:
     return [
-            {
-                "tag": tag,
-                "desc": details.description,
-                "unit": details.unit,
-                "ranges": {
-                    "min": details.min_val, "max": details.max_val,
-                    "hi_hi": details.hi_hi, "hi": details.hi,
-                    "low": details.low, "low_low": details.low_low
-                },
-                "component_reference": details.component_reference,
-                "actionable_guidance": details.actionable_guidance
-            }
-            for tag, details in TAG_DETAILS.items()
-        ]
+        {
+            "tag": tag,
+            "desc": details.description,
+            "unit": details.unit,
+            "ranges": {
+                "min": details.min_val, "max": details.max_val,
+                "hi_hi": details.hi_hi, "hi": details.hi,
+                "low": details.low, "low_low": details.low_low
+            },
+            "component_reference": details.component_reference,
+            "actionable_guidance": details.actionable_guidance
+        }
+        for tag, details in TAG_DETAILS.items()
+    ]
 
 
 @mcp.tool(description="Look up the fixed EPF JT tags by tag/prefix or by keywords like 'temperature' or 'pressure'. Returns matching tags with descriptions.")
@@ -836,6 +747,7 @@ def fixed_tags_lookup(query: str) -> List[Dict[str, str]]:
     out = [{"tag": t, "desc": d, "unit": TAG_DETAILS.get(t).unit if t in TAG_DETAILS else None} for t, d in pairs]
     _dbg(f"[fixed_tags_lookup] Matches={len(out)}")
     return out
+
 
 @mcp.tool(description="Get description for a specific tag from the fixed set only. Returns {'tag','desc','source'='fixed'|'not_found'}.")
 def fixed_tag_describe(tag_name: str) -> Dict[str, Any]:
@@ -850,9 +762,9 @@ def fixed_tag_describe(tag_name: str) -> Dict[str, Any]:
     _dbg("[fixed_tag_describe] NOT FOUND")
     return {"tag": tag, "desc": None, "source": "not_found"}
 
-
-# P&ID context tool (reads local pid.txt)
-
+# ==========================
+# P&ID context tool
+# ==========================
 @mcp.tool(description="Fetch P&ID context from local pid.txt. Returns full file and automatically fetches weather for the same period if available.")
 def pid_context(tags: Optional[str] = None,
                 start_time: Optional[str] = None,
@@ -884,70 +796,110 @@ def pid_context(tags: Optional[str] = None,
         "weather": weather_data
     }
 
-
-
-
-# One-shot context query (resolve → values → P&ID from pid.txt)
-@mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then fetch ISPPLANTDATA values. Use limit for latest N; otherwise supply a time window or relative='last 7 days'. Returns values + in-memory tag desc + local pid.txt context.")
+# ==========================
+# Aggregation-FIRST value/context query (replaces raw fetch path)
+# ==========================
+@mcp.tool(description="Resolve tags from free-text (or ALL tags for 'performance/analysis/trend' asks), then fetch ISPPLANTDATA **aggregated** values (avg) using smart bin policy; returns values + tag desc + pid context + weather.")
 def context_values_by_query(
     query: str,
     start_time: Optional[str] = None,
     end_time:   Optional[str] = None,
-    limit:      Optional[int] = None,
     database:   str = DB,
     relative:   Optional[str] = None,
-    period: Optional[str] = None   # NEW
+    period: Optional[str] = None
 ) -> Dict[str, Any]:
-    _dbg(f"[context_values_by_query] query='{query}' limit={limit} start={start_time} end={end_time} DB={database} relative={relative} period={period}")
+    _dbg(f"[context_values_by_query] query='{query}' start={start_time} end={end_time} DB={database} relative={relative} period={period}")
     tags = _resolve_tags_for_query(query, default_all_if_perf=True)
     _dbg(f"[context_values_by_query] tags_resolved={tags}")
     if not tags:
         return {"tags_resolved": [], "note": "No tags matched your query."}
 
-    tags_csv = ",".join(tags)
-
-    # Fetch values (limit or window with relative support)
-    if limit:
-        values = isp_get_tags_data(tag_names=tags_csv, limit=limit, database=database)
+    now = datetime.datetime.now(timezone.utc)
+    if relative:
+        win = _parse_relative_window(relative, now)
+        if win:
+            start_dt, end_dt = win
+        else:
+            end_dt = now
+            start_dt = end_dt - timedelta(minutes=15)
     else:
-        values = isp_get_tags_data(tag_names=tags_csv, start_time=start_time, end_time=end_time, database=database, relative=relative)
-    _dbg(f"[context_values_by_query] values_rows={len(values)}")
-
-    # In-memory descriptions & local P&ID context
-    inmem = [_meta_for_tag(t) for t in tags]
-    pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=period)
-    # pid = pid_context(start_time=start_time, end_time=end_time, relative=relative, period=None)
-    
-    # Attach weather if this is a performance/trend/analysis ask
-    weather_data = pid.get("weather", [])
-    if PERF_WORDS.search(query or ""):
         try:
-            weather_data = _get_weather_for_window(start_time, end_time, relative, period=period)
-        except Exception as e:
-            _dbg(f"[context_values_by_query] Weather fetch error: {e}")
+            end_dt   = _parse_iso_dt(end_time, now)
+            start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
+        except ValueError as e:
+            return {"tags_resolved": tags, "error": str(e)}
+
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    chosen_span, bin_meta = _choose_smart_bin(start_dt, end_dt, period)
+
+    # Fetch aggregated
+    rows = isp_stats(
+        tag_names=",".join(tags),
+        agg="avg",
+        period=chosen_span,
+        start_time=_utc_str(start_dt),
+        end_time=_utc_str(end_dt),
+        database=database,
+        relative=None,
+    )
+
+    # Map to canonical series per tag (Timestamp, TagName, Value)
+    by_tag: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        t = r.get(ISP_TAG_COL)
+        ts = r.get(ISP_TS_COL)
+        val = r.get("avg_val")
+        if t is None:
+            continue
+        if ts is None and isinstance(val, (int, float)):
+            # unbinned aggregate; synthesize a single timestamp at end_dt
+            ts = _utc_str(end_dt)
+        by_tag.setdefault(t, []).append({
+            "Timestamp": ts,
+            "TagName": t,
+            "Value": val,
+        })
+
+    for t in by_tag:
+        by_tag[t].sort(key=lambda r: r.get("Timestamp"))
+
+    inmem = [_meta_for_tag(t) for t in tags]
+    pid = pid_context(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), relative=None, period=chosen_span)
 
     out = {
         "tags_resolved": tags,
         "tag_context_in_memory": inmem,
-        "values": values,
+        "series": by_tag,                      # per-tag series (canonical shape)
+        "values": rows,                        # raw aggregated KQL output (compat)
+        "period": chosen_span,
+        "time_window": {
+            "start_time": _utc_str(start_dt),
+            "end_time": _utc_str(end_dt),
+            "relative": relative,
+        },
+        "bin_policy": bin_meta,
         "pid_context": pid,
-        "weather": weather_data
+        "weather": pid.get("weather", []),
     }
     return out
 
-
-@mcp.tool(description="Evaluate performance vs thresholds using TAG_DETAILS. Resolves tags by query (all canonical tags for performance-style asks). Compares raw values to thresholds and summarizes min/max/avg, trend, status distribution, anomalies, P&ID and optional weather.")
+# ==========================
+# Performance analysis (now uses aggregated values only)
+# ==========================
+@mcp.tool(description="Evaluate performance vs thresholds using aggregated values (smart-binned). Resolves tags by query (ALL canonical for perf-style). Returns per-tag summaries + anomalies + P&ID + optional weather.")
 def isp_performance_for_query(
     query: Optional[str] = None,
     tag_names: Optional[str] = None,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     relative: Optional[str] = None,
-    limit: Optional[int] = None,
     database: str = DB,
-    with_weather: bool = False
+    with_weather: bool = False,
+    period: Optional[str] = None,
 ) -> Dict[str, Any]:
-    _dbg(f"[isp_performance_for_query] query='{query}' tag_names='{tag_names}' start={start_time} end={end_time} relative={relative} limit={limit} weather={with_weather}")
+    _dbg(f"[isp_performance_for_query] query='{query}' tag_names='{tag_names}' start={start_time} end={end_time} relative={relative} weather={with_weather} period={period}")
 
     # Resolve tags
     if tag_names:
@@ -958,47 +910,55 @@ def isp_performance_for_query(
     if not tags:
         return {"tags_resolved": [], "note": "No tags found to evaluate."}
 
-    # Fetch raw values (limit OR window/relative)
-    tags_csv = ",".join(tags)
-    if limit:
-        values = isp_get_tags_data(tag_names=tags_csv, limit=limit, database=database)
-        window_info = {"mode": f"latest {int(limit)}"}
-        # infer start/end from returned data if present
-        if values:
-            window_info["start_time"] = values[-1]["Timestamp"]
-            window_info["end_time"] = values[0]["Timestamp"]
+    now = datetime.datetime.now(timezone.utc)
+    if relative:
+        win = _parse_relative_window(relative, now)
+        if win:
+            start_dt, end_dt = win
+        else:
+            end_dt = now
+            start_dt = end_dt - timedelta(minutes=15)
     else:
-        values = isp_get_tags_data(tag_names=tags_csv, start_time=start_time, end_time=end_time, relative=relative, database=database)
-        # Normalize/echo actual window used
-        now = datetime.datetime.now(timezone.utc)
         try:
             end_dt   = _parse_iso_dt(end_time, now)
             start_dt = _parse_iso_dt(start_time, end_dt - timedelta(minutes=15))
-            if relative:
-                win = _parse_relative_window(relative, now)
-                if win:
-                    start_dt, end_dt = win
-        except Exception:
-            end_dt = now
-            start_dt = end_dt - timedelta(minutes=15)
-        window_info = {
-            "start_time": _utc_str(start_dt),
-            "end_time": _utc_str(end_dt),
-            "relative": relative
-        }
+        except ValueError as e:
+            return {"tags_resolved": tags, "error": str(e)}
 
-    # Group rows by tag for per-tag analysis
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    chosen_span, bin_meta = _choose_smart_bin(start_dt, end_dt, period)
+
+    # Aggregated values fetch
+    agg_rows = isp_stats(
+        tag_names=",".join(tags),
+        agg="avg",
+        period=chosen_span,
+        start_time=_utc_str(start_dt),
+        end_time=_utc_str(end_dt),
+        database=database,
+        relative=None,
+    )
+
+    # Canonicalize for summarizer
     by_tag: Dict[str, List[Dict[str, Any]]] = {}
-    for r in values:
-        t = r.get("TagName")
-        if t:
-            by_tag.setdefault(t, []).append(r)
-
-    # Ensure ascending by time for summaries
+    for r in agg_rows:
+        t = r.get(ISP_TAG_COL)
+        ts = r.get(ISP_TS_COL)
+        val = r.get("avg_val")
+        if t is None:
+            continue
+        if ts is None and isinstance(val, (int, float)):
+            ts = _utc_str(end_dt)
+        by_tag.setdefault(t, []).append({
+            "Timestamp": ts,
+            "TagName": t,
+            "Value": val,
+        })
     for t in by_tag:
         by_tag[t].sort(key=lambda r: r.get("Timestamp"))
 
-    # Build per-tag evaluations
     evaluations: Dict[str, Any] = {}
     global_anomalies: List[Dict[str, Any]] = []
 
@@ -1010,37 +970,43 @@ def isp_performance_for_query(
             "meta": meta,
             "summary": summary
         }
-        # collect anomalies with tag label
         for a in summary["anomalies"]:
             a2 = dict(a)
             a2["tag"] = t
             a2["unit"] = meta.get("unit")
             global_anomalies.append(a2)
 
-    # P&ID context (use same period as window_info if available)
-    pid = pid_context(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), relative=window_info.get("relative"))
+    pid = pid_context(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), relative=None, period=chosen_span)
 
-    # Optional weather
     weather = []
     if with_weather:
         try:
-            weather = plant_weather(start_time=window_info.get("start_time"), end_time=window_info.get("end_time"), agg="avg", period="1h")
+            weather = plant_weather(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), agg="avg", period="1h")
         except Exception as e:
             _dbg(f"[isp_performance_for_query] weather error: {e}")
 
     out = {
         "tags_resolved": tags,
         "tag_context_in_memory": [_meta_for_tag(t) for t in tags],
-        "window": window_info,
-        "evaluations": evaluations,       # per-tag summaries & status distributions
-        "anomalies": global_anomalies,    # flat list across all tags
+        "window": {
+            "start_time": _utc_str(start_dt),
+            "end_time": _utc_str(end_dt),
+            "relative": relative,
+        },
+        "period": chosen_span,
+        "bin_policy": bin_meta,
+        "evaluations": evaluations,
+        "anomalies": global_anomalies,
         "pid_context": pid,
-        "weather": weather
+        "weather": weather,
     }
     _dbg(f"[isp_performance_for_query] tags={len(tags)} anomalies={len(global_anomalies)}")
     return out
 
-@mcp.tool(description="Resolve tags from free-text (or default to ALL tags for 'performance/analysis/trend' asks), then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to '1h' if not provided. You may pass relative='last 7 days'. Returns results + in-memory tag desc + local pid.txt context.")
+# ==========================
+# Query-time aggregate convenience wrapper
+# ==========================
+@mcp.tool(description="Resolve tags then compute aggregates over ISPPLANTDATA. agg in (avg,min,max,sum,count). period defaults to smart policy. Returns P&ID context and bin-policy metadata.")
 def isp_aggregate_for_query(
     query: Optional[str] = None,
     tag_names: Optional[str] = None,
@@ -1062,10 +1028,6 @@ def isp_aggregate_for_query(
     if not tags:
         return {"tags_resolved": [], "note": "No tags found to aggregate."}
 
-    # Default resolution: hourly if not specified
-    span = _normalize_period(period) or "1h"
-
-    # --- Derive the actual time window here (same logic as isp_stats) ---
     now = datetime.datetime.now(timezone.utc)
     if relative:
         win = _parse_relative_window(relative, now)
@@ -1084,21 +1046,8 @@ def isp_aggregate_for_query(
     if start_dt > end_dt:
         start_dt, end_dt = end_dt, start_dt
 
-    # --- Enforce bin policy for long windows (ISPPLANTDATA only) ---
-    span_before = span
-    span = _coerce_min_bin_for_window(span, start_dt, end_dt)
-    window_days = (end_dt - start_dt).total_seconds() / 86400.0
-    coerced = (span_before != span)
-    coercion_note = None
-    if coerced:                      # NEW
-        coercion_note = (            # NEW
-            f"Requested period {span_before or 'None'} coerced to {span} "
-            f"because window {window_days:.2f} days exceeds {LONG_WINDOW_THRESHOLD_DAYS}-day minimum-bin policy."
-        )
-    _dbg(f"[isp_aggregate_for_query] Bin policy: requested={span_before!r} -> used={span!r}; window_days={window_days:.2f}")
-    # _dbg(f"[isp_aggregate_for_query] Bin policy: requested={span_before!r} -> used={span!r}; window_days={(end_dt-start_dt).total_seconds()/86400:.2f}")
+    span, bin_meta = _choose_smart_bin(start_dt, end_dt, period)
 
-    # Use the coerced span everywhere downstream for consistency (plant data)
     rows = isp_stats(
         tag_names=",".join(tags),
         agg=agg,
@@ -1106,17 +1055,16 @@ def isp_aggregate_for_query(
         start_time=_utc_str(start_dt),
         end_time=_utc_str(end_dt),
         database=database,
-        relative=None,  # already resolved
+        relative=None,
     )
 
     inmem = [_meta_for_tag(t) for t in tags]
-    # IMPORTANT: keep weather independent -> do NOT pass the plant period here
     pid = pid_context(start_time=_utc_str(start_dt), end_time=_utc_str(end_dt), relative=None, period=None)
 
     out: Dict[str, Any] = {
         "tags_resolved": tags,
         "aggregate": agg,
-        "period": span,  # report the actual bin used
+        "period": span,
         "results": rows,
         "time_window": {
             "start_time": _utc_str(start_dt),
@@ -1125,20 +1073,15 @@ def isp_aggregate_for_query(
         },
         "tag_context_in_memory": inmem,
         "pid_context": pid,
-        "bin_policy": {
-            "requested": span_before,
-            "used": span,
-            "coerced": coerced,
-            "window_days": window_days,
-            "threshold_days": LONG_WINDOW_THRESHOLD_DAYS
-        },
-        "coercion_note": coercion_note,  # string or None
+        "bin_policy": bin_meta,
     }
 
     _dbg(f"[isp_aggregate_for_query] results_rows={len(rows)}")
     return out
 
+# ==========================
 # Weather tool
+# ==========================
 @mcp.tool(
     description="Fetch plant weather data from KM400WeatherDataTBL. Supports raw rows, top-N latest, or aggregated (avg/min/max/sum/count) over a time window with optional binning."
 )
@@ -1182,7 +1125,7 @@ def plant_weather(
         if agg_l not in ("avg", "min", "max", "sum", "count"):
             return [{"error": f"Unsupported agg '{agg}'. Use avg,min,max,sum,count."}]
 
-        span = _normalize_period(period)
+        span = _normalize_period(period) or "1h"
         metrics = [
             "temp", "heatIndex", "windChill", "windSpeed", "windGust",
             "pressure", "precipRate", "precipTotal", "winddir", "humidity"
@@ -1193,7 +1136,7 @@ def plant_weather(
             kql = (
                 "KM400WeatherDataTBL "
                 f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
-                f"| summarize {agg_exprs} by bin(Timestamp, 1h) "
+                f"| summarize {agg_exprs} by bin(Timestamp, {span}) "
                 "| order by Timestamp asc"
             )
         else:
@@ -1207,7 +1150,6 @@ def plant_weather(
         _dbg(f"[plant_weather] rows={len(rows)} (agg mode - all metrics)")
         return rows
 
-    # Raw mode: fetch all metrics
     kql = (
         "KM400WeatherDataTBL "
         f"| where Timestamp between (datetime({start_str})..datetime({end_str})) "
@@ -1217,9 +1159,9 @@ def plant_weather(
     _dbg(f"[plant_weather] rows={len(rows)} (raw mode)")
     return rows
 
-
-
-# SSE transport & application setup
+# ==========================
+# App & SSE transport
+# ==========================
 transport = SseServerTransport("/messages/")
 
 async def handle_sse(request):
